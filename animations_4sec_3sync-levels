@@ -1,0 +1,488 @@
+# -----------------------------------------------------------------------------------
+# SCRIPT TO GENERATE ANIMATIONS OF FOUR CONDITIONS
+# -----------------------------------------------------------------------------------
+
+# This script generates animations for the experiment on social influence on agency perception.
+# The animations follow a 2x2 factorial design:
+# - Synchrony: high vs. low (manipulated by cross-correlation parameter)
+# - Directed motion: present vs. absent
+# The animations are around 4 seconds long, with discs starting in random directions.
+
+# Type 1: Low synchrony - directed motion present
+# Type 2: High synchrony - directed motion present
+# Type 5: Low synchrony - directed motion absent
+# Type 8: High synchrony - directed motion absent
+
+# -----------------------------------------------------------------------------------
+#Load Required Packages
+# -----------------------------------------------------------------------------------
+
+import os
+import types
+import cv2
+import numpy as np
+from numpy import kron, linalg, ones, sin
+from numpy.random import randn, seed
+from scipy.linalg import expm
+import csv
+
+# -----------------------------------------------------------------------------------
+# Initialize Simulation Parameters and System Dynamics
+# -----------------------------------------------------------------------------------
+
+# Set a fixed random seed for reproducibility
+SEED = 0
+seed(SEED)
+
+# Option to mute script output
+silent = False
+if not silent:
+    print(f"The seed is {SEED}")
+
+# Define a namespace to store important parameters
+a = types.SimpleNamespace()
+
+# Number of simulation steps
+a.N = 960
+
+# Time step:
+# - 240 steps per second
+# - Total duration = 960/240Hz = ~4.00 seconds per animation
+a.dt = 0.025
+
+# System matrix for exponential integration (used for trajectory computation)
+a.j = np.matrix([[-0.01, 0], [0, -0.01]])
+
+# Transformation matrix (varies by trial condition)
+a.C = None
+
+# Initial positions of both discs (centered at (0,0))
+# - Encoding format: (x1, y1, x2, y2)
+a.x0 = np.matrix([[0, 0, 0, 0]]).transpose()
+
+# Motion noise scaling factor
+a.W = 10
+
+# Scaling factor for movement range:
+# - Higher values mean points move further from the screen center
+a.amp = 250
+
+# -----------------------------------------------------------------------------------
+# Function to Generate Motion Trajectories for Two Moving Discs
+# -----------------------------------------------------------------------------------
+
+def agents_int(N=a.N, dt=a.dt, j=a.j, C=a.C, x0=a.x0, W=a.W, phi=0):
+    """
+    Simulates the trajectories of two moving points (discs) over time.
+
+    Parameters:
+    - N: Number of time steps
+    - dt: Time step duration
+    - j: System matrix
+    - C: Transformation matrix (depends on trial type)
+    - x0: Starting positions
+    - W: Noise scaling factor
+    - phi: Phase shift for sinusoidal movement (i.e. starting disc's directions)
+
+    Returns:
+    - X: Matrix of time-step-by-time-step coordinates for the two discs.
+    """
+    n = 2  # Number of objects
+    J = kron(C, j)  # Apply transformation matrix to system dynamics
+    eJ = expm(J * dt)  # Exponentiated system matrix for time stepping
+    X = np.matrix(np.zeros([n * 2, N]))  # Initialize state matrix
+    sin_amp = 3  # Amplitude for sinusoidal movement
+
+    # Set initial state with some random noise
+    s0 = 10 * randn(1, 4)
+    X[:, 0] = x0
+
+    # Simulate motion over N-1 time steps
+    for i in range(N - 1):
+        x = X[:, i]
+        x = (
+                eJ * x
+                + W * randn(2 * n, 1) * dt  # Add random noise
+                + np.matrix([
+            [sin_amp * sin(i / 100 + phi) / 7,  # Sinusoidal movement in x1
+             sin_amp * sin(i / 200 + phi) / 10,  # Sinusoidal movement in y1
+             sin_amp * sin(i / 50 + phi) / 2,  # Sinusoidal movement in x2
+             sin_amp * sin(i / 40 + phi) / 1.5]  # Sinusoidal movement in y2
+        ]).transpose()
+        )
+        X[:, i + 1] = x  # Store updated state
+
+    return X.transpose()
+
+# -----------------------------------------------------------------------------------
+# Define Properties of Animated Discs
+# -----------------------------------------------------------------------------------
+
+# Object (disc) size in pixels
+objSize = 22
+
+# Define disc colors as RGB values:
+# - First row: Red (1,0,0)
+# - Second row: Blue (0,0,1)
+ballcolor = np.matrix(
+    [[1, 0, 0], [0, 0, 1]]
+)
+
+# Determine whether directed motion is present or absent:
+# - Trial types 5 and 8 lack directed motion, we map them onto existing values by subtracting 4.
+scalepts = 4
+
+# Number of repetitions per condition
+Nreps = 15
+
+# Generate trial order by repeating condition numbers Nreps times
+numbers = np.array([1.0, 2.5, 4.0, 5.0, 6.5, 8.0])
+trialorder = np.kron(numbers, np.ones(Nreps, dtype=float))
+
+# Make sure trialorder only contains your explicitly defined types
+expected = np.array([1.0, 2.5, 4.0, 5.0, 6.5, 8.0])
+assert np.all(np.isin(trialorder, expected)), "Trial order contains unexpected values!"
+
+# Print trial order if not in silent mode
+if not silent:
+    print("We have the following trial order:")
+    print(trialorder)
+
+# -----------------------------------------------------------------------------------
+# Loop Through Each Trial to Generate Trajectories
+# -----------------------------------------------------------------------------------
+
+# Create an empty list to store trajectory data for all 80 samples
+stims = list()
+
+# Loop through each trial in the `trialorder` list
+for tr in range(len(trialorder)):
+    # Generate a random starting angle `phi` between 0 and 2π (randomizing the initial movement direction)
+    phi = np.random.uniform(0, 2 * np.pi)
+
+    # -----------------------------------------------------------------------------------
+    # Define Transformation Matrix `a.C` Based on Trial Type
+    # -----------------------------------------------------------------------------------
+
+    # Define the transformation matrix `a.C`
+    # The first term [[1,0],[0,1]] represents an identity matrix (no transformation)
+    # The second term [[0,-1],[1,0]] represents a rotation transformation
+    # `trialorder[tr]` scales the effect of the rotation
+    a.C = np.matrix([[1, 0], [0, 1]]) + 13 * np.matrix([[0, -1], [1, 0]]) * trialorder[tr]
+
+    # Alternative setting: setting the diagonal elements to zero
+    # This would eliminate decay towards the origin, but this does not seem to have a large effect as the sinusoidal motion already dominates
+    # a.C = np.matrix([[0, 0], [0, 0]]) + 13 * np.matrix([[0, -1], [1, 0]]) * trialorder[tr]
+
+    # -----------------------------------------------------------------------------------
+    # Generate Trajectory Data Using the `agents_int` Function
+    # -----------------------------------------------------------------------------------
+
+    # Generate trajectory data using the `agents_int` function
+    M = agents_int(C=a.C, phi=phi)
+
+    # -----------------------------------------------------------------------------------
+    # Apply Transformations for Directed Motion Absent Conditions
+    # -----------------------------------------------------------------------------------
+
+    # Apply transformations if `trialorder[tr]` exceeds `scalepts` (which is 4). I.e. this generates the animations with directed motion absent.
+    if trialorder[tr] > scalepts:
+        # Modify `a.C` by subtracting `scalepts` from `trialorder[tr]`
+        a.C = np.matrix([[0, 0], [0, 0]]) + 13 * np.matrix([[0, -1], [1, 0]]) * (trialorder[tr] - scalepts)
+
+        # Recalculate trajectories with the adjusted transformation matrix
+        M = agents_int(C=a.C, phi=phi)
+        temp = M
+
+        # Apply a flipping operation to specific columns of the matrix
+        # - temp[:, 0:2]: Keeps the first two columns (X1, Y1) unchanged (first disc).
+        # - -np.flip(temp[:, 3:4]): Flips the Y-coordinates of the second disc and negates them.
+        # - np.flip(temp[:, 2:3]): Flips the X-coordinates of the second disc.
+        M = np.concatenate([temp[:, 0:2], -np.flip(temp[:, 3:4]), np.flip(temp[:, 2:3])], axis=1)
+
+    # -----------------------------------------------------------------------------------
+    # Downsample and Scale the Trajectories
+    # -----------------------------------------------------------------------------------
+
+    # Downsample the trajectories by selecting every fourth point (reducing resolution)
+    M = M[::4, :]
+
+    # Scale the positions using `a.amp`
+    m = M * a.amp
+
+    # -----------------------------------------------------------------------------------
+    # Store the Generated Trajectories
+    # -----------------------------------------------------------------------------------
+
+    # Create a namespace object to store trajectory data for this sample
+    sample = types.SimpleNamespace()
+    sample.X1 = M[:, 0].A1  # X-coordinates of the first disc (80 sequences, 256 points each)
+    sample.Y1 = M[:, 1].A1  # Y-coordinates of the first disc
+    sample.X2 = M[:, 2].A1  # X-coordinates of the second disc
+    sample.Y2 = M[:, 3].A1  # Y-coordinates of the second disc
+    sample.type = trialorder[tr]  # Store the trial type (1, 4, 5, or 8)
+
+    # Append the sample data to the `stims` list
+    stims.append(sample)
+
+    # -----------------------------------------------------------------------------------
+    # Save Coordinates in CSV File to be Used in Script That Calculates Speed Scaling Factors
+    # -----------------------------------------------------------------------------------
+
+    # Define filename for saving transformed and downsampled (but unscaled) trajectories
+    unscaled_csv_filename = os.path.join("output", f"dots_{tr:02d}_type{trialorder[tr]}.0_seed{SEED}.csv")
+    os.makedirs("output", exist_ok=True)  # Ensure the output folder exists
+
+    # Save unscaled X and Y coordinates for both discs
+    with open(unscaled_csv_filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['X1', 'Y1', 'X2', 'Y2'])  # Write header row
+        for j in range(len(M)):  # Loop through all time steps
+            writer.writerow([M[j, 0], M[j, 1], M[j, 2], M[j, 3]])
+
+    # Print confirmation if silent mode is disabled
+    if not silent:
+        print(f"Saved transformed and downsampled (but unscaled) positions to {unscaled_csv_filename}")
+
+    # IMPORTANT: This output is used in script "Animations_speed_scaling_factors"
+    # The speed scaling factors calculated in this script are then input below.
+
+# Print confirmation message if `silent` mode is disabled
+if not silent:
+    print(f"We calculated {len(stims)} trajectories!")
+
+# -----------------------------------------------------------------------------------
+# Function to Render Two Moving Discs in an Image Frame
+# -----------------------------------------------------------------------------------
+
+# Function to draw two discs at given coordinates
+def drawdots(x1, y1, x2, y2, objSize=objSize, ballcolor=ballcolor):
+    """
+    Creates a 1280x1024 image with two discs positioned at (x1, y1) and (x2, y2).
+    Parameters:
+    x1, y1: Coordinates of the first disc
+    x2, y2: Coordinates of the second disc
+    objSize: Diameter of the discs
+    ballcolor: RGB colors for the two discs
+    """
+    width = 1280
+    height = 1024
+    img = np.zeros((height, width, 3), dtype="uint8")
+
+    # Draw the first disc
+    cv2.circle(
+        img,
+        (width // 2 + round(x1), height // 2 + round(y1)),
+        objSize,
+        (ballcolor[0].A1 * 255).astype(int).tolist(),
+        cv2.FILLED,
+    )
+
+    # Draw the second disc
+    cv2.circle(
+        img,
+        (width // 2 + round(x2), height // 2 + round(y2)),
+        objSize,
+        (ballcolor[1].A1 * 255).astype(int).tolist(),
+        cv2.FILLED,
+    )
+
+    return img
+
+
+# -----------------------------------------------------------------------------------
+# Speed Scaling and Output Generation
+# -----------------------------------------------------------------------------------
+
+use_scaling = True # Set to True if you want to apply speed scaling factors
+
+# Define speed scaling factors for different trial types
+# IMPORTANT: These are calculated in the script "Animations_speed_scaling_factors"
+# These factors are applied to the disc movements to ensure consistency across conditions.
+scaling_factors = {
+    1: (2.1147, 1.2769),  # Scaling for type 1 (low synchrony, directed motion present)
+    2.5: (0.9731, 1.0324),
+    4: (0.6670, 0.8012),  # Scaling for type 4 (high synchrony, directed motion present)
+    5: (2.1147, 1.2769),  # Scaling for type 5 (low synchrony, directed motion absent)
+    6.5: (0.9731, 1.0324),
+    8: (0.6670, 0.8012)  # Scaling for type 8 (high synchrony, directed motion absent)
+}
+
+# -----------------------------------------------------------------------------------
+# Function to Generate and Save a Video
+# -----------------------------------------------------------------------------------
+
+def create_video(X1, Y1, X2, Y2, filename, codec, scale_factor_disc1, scale_factor_disc2, use_scaling=True):
+    """
+    Generates a video from trajectory data with applied scaling factors.
+    Parameters:
+    - X1, Y1: Scaled X and Y positions for the first disc.
+    - X2, Y2: Scaled X and Y positions for the second disc.
+    - filename: Name of the output video file.
+    - codec: Video compression format (e.g., "MJPG").
+    - scale_factor_disc1: Scaling factor for the first disc.
+    - scale_factor_disc2: Scaling factor for the second disc.
+
+    """
+    if use_scaling:
+        X1_scaled = [x * scale_factor_disc1 for x in X1]
+        Y1_scaled = [y * scale_factor_disc1 for y in Y1]
+        X2_scaled = [x * scale_factor_disc2 for x in X2]
+        Y2_scaled = [y * scale_factor_disc2 for y in Y2]
+    else:
+        X1_scaled = X1
+        Y1_scaled = Y1
+        X2_scaled = X2
+        Y2_scaled = Y2
+
+    # Initialize video writer with 60 FPS and resolution 1280x1024
+    out = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*codec), 60, (1280, 1024))
+
+    # Loop through each time step and add a frame to the video
+    for i in range(len(X1_scaled)):
+        out.write(drawdots(X1_scaled[i], Y1_scaled[i], X2_scaled[i], Y2_scaled[i]))
+
+    # Finalize and save the video file
+    out.release()
+
+
+# -----------------------------------------------------------------------------------
+# Function to Generate Videos from Stored Trajectory Data
+# -----------------------------------------------------------------------------------
+
+def apply_scaling_and_generate_outputs(stims, folder="output", silent=False, extension="avi", codec="MJPG"):
+    """
+    Applies the scaling factor to the trajectories and dumps the results into video files based on trial order.
+
+    Parameters:
+    - stims: List of trajectory samples containing X/Y coordinates.
+    - folder: Directory where the output videos will be saved.
+    - silent: If False, prints confirmation messages.
+    - extension: File format for the video output (default: "avi").
+    - codec: Video compression format.
+
+    """
+    os.makedirs(folder, exist_ok=True)
+
+    # Loop through each sample in `stims` and generate videos
+    for i, sample in enumerate(stims):
+        # Retrieve scaling factors for this trial type
+        if use_scaling:
+            scale_factor_disc1, scale_factor_disc2 = scaling_factors[float(sample.type)]
+        else:
+            scale_factor_disc1, scale_factor_disc2 = 1.0, 1.0  # no scaling
+
+        # Define filename for video output
+        filename = os.path.join(folder, f"dots_{i:02d}_type{sample.type}_seed{SEED}.{extension}")
+
+        # Generate and save video using trajectory data
+        create_video(
+            sample.X1, sample.Y1, sample.X2, sample.Y2,
+            filename, codec, scale_factor_disc1, scale_factor_disc2,
+            use_scaling=use_scaling
+        )
+
+        # Print confirmation if silent mode is disabled
+        if not silent:
+            print(f"We successfully created the video {filename}")
+
+# -----------------------------------------------------------------------------------
+# Function to Generate and Save Trajectory Images
+# -----------------------------------------------------------------------------------
+
+def create_trajectory_image(X1_scaled, Y1_scaled, X2_scaled, Y2_scaled, filename):
+    """
+    Generates and saves a static trajectory image for visualization.
+
+    Parameters:
+    - X1_scaled, Y1_scaled: Scaled X and Y positions for the first disc.
+    - X2_scaled, Y2_scaled: Scaled X and Y positions for the second disc.
+    - filename: Output filename for the image.
+    """
+    width = 1280
+    height = 1024
+    linewidth = 1  # Line thickness for trajectory visualization
+    img = np.ones((height, width, 3), dtype="uint8") * 255  # White background
+
+    # Convert lists to numpy arrays and ensure they are integers
+    X1_scaled = np.array(X1_scaled, dtype=np.int32)
+    Y1_scaled = np.array(Y1_scaled, dtype=np.int32)
+    X2_scaled = np.array(X2_scaled, dtype=np.int32)
+    Y2_scaled = np.array(Y2_scaled, dtype=np.int32)
+
+    # Calculate positions for drawing, ensuring the correct shape for OpenCV polylines
+    p1 = np.stack((width // 2 + X1_scaled, height // 2 + Y1_scaled), axis=1).reshape(-1, 1, 2)
+    p2 = np.stack((width // 2 + X2_scaled, height // 2 + Y2_scaled), axis=1).reshape(-1, 1, 2)
+
+    # Draw trajectory lines for each disc
+    cv2.polylines(img, [p1], isClosed=False, color=(255, 0, 0), thickness=linewidth)
+    cv2.polylines(img, [p2], isClosed=False, color=(0, 0, 255), thickness=linewidth)
+    cv2.imwrite(filename, img)
+
+
+# -----------------------------------------------------------------------------------
+# Function to Save Trajectory Images and CSV Files
+# -----------------------------------------------------------------------------------
+
+def dumpimages(stims, folder="output", silent=False):
+    """
+    Saves trajectory images and CSV files for each sample in the `stims` list.
+
+    Parameters:
+    - stims: List of trajectory samples, each containing X/Y coordinates and trial type.
+    - folder: Directory where the output images and CSV files will be saved (default: "output").
+    - silent: If False, prints confirmation messages for each saved file.
+    """
+
+    # Ensure the output folder exists, create it if necessary
+    os.makedirs(folder, exist_ok=True)
+
+    # Loop through all samples in `stims` and process them one by one
+    for i, sample in enumerate(stims):
+        # Retrieve scaling factors based on the trial type
+        if use_scaling:
+            scale_factor_disc1, scale_factor_disc2 = scaling_factors[float(sample.type)]
+        else:
+            scale_factor_disc1, scale_factor_disc2 = 1.0, 1.0
+
+        # Scale the coordinates for both discs
+        X1_scaled = [x * scale_factor_disc1 for x in sample.X1]
+        Y1_scaled = [y * scale_factor_disc1 for y in sample.Y1]
+        X2_scaled = [x * scale_factor_disc2 for x in sample.X2]
+        Y2_scaled = [y * scale_factor_disc2 for y in sample.Y2]
+
+        # Define filenames for the image and CSV file
+        image_filename = os.path.join(folder, f"dots_{i:02d}_type{sample.type}_seed{SEED}.jpg")
+        csv_filename = os.path.join(folder, f"dots_{i:02d}_type{sample.type}_seed{SEED}.csv")
+
+        # Generate and save the trajectory image using the scaled coordinates
+        create_trajectory_image(X1_scaled, Y1_scaled, X2_scaled, Y2_scaled, image_filename)
+
+        # Save scaled X and Y coordinates for both discs in a CSV file
+        with open(csv_filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['X1', 'Y1', 'X2', 'Y2'])  # Write header row
+            for j in range(len(X1_scaled)):  # Loop through all trajectory points
+                writer.writerow([X1_scaled[j], Y1_scaled[j], X2_scaled[j], Y2_scaled[j]])
+
+        # Print confirmation messages if `silent` mode is disabled
+        if not silent:
+            print(f"We successfully created the image {image_filename}")
+            print(f"We successfully saved the CSV file {csv_filename}")
+
+
+# -----------------------------------------------------------------------------------
+# Execute Output Generation
+# -----------------------------------------------------------------------------------
+
+# Generate videos from trajectory data
+apply_scaling_and_generate_outputs(stims, folder="output", silent=silent, extension="avi", codec="MJPG")
+
+# Generate and save trajectory images and CSV files
+dumpimages(stims, folder="output", silent=silent)
+
+# Print completion message if `silent` mode is disabled
+if not silent:
+    print("My work is done, goodbye!")
+
+# Note: Before web use, animations need to be encoded as MP4 with the H.264 codec using the Handbrake encoder.
