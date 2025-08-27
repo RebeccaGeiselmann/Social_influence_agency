@@ -3,15 +3,17 @@
 # -----------------------------------------------------------------------------------
 
 # This script generates animations for the experiment on social influence on agency perception.
-# The animations follow a 2x2 factorial design:
-# - Synchrony: high vs. low (manipulated by cross-correlation parameter)
+# The animations follow a 3x2 factorial design:
+# - Synchrony: high vs. medium vs. low (manipulated by cross-correlation parameter)
 # - Directed motion: present vs. absent
 # The animations are around 4 seconds long, with discs starting in random directions.
 
-# Type 1: Low synchrony - directed motion present
-# Type 2: High synchrony - directed motion present
-# Type 5: Low synchrony - directed motion absent
-# Type 8: High synchrony - directed motion absent
+# Type 1.0: Low synchrony - directed motion present
+# Type 2.5: Medium synchrony - directed motion present
+# Type 4.0: High synchrony - directed motion present
+# Type 5.0: Low synchrony - directed motion absent
+# Type 6.5: Medium synchrony - directed motion absent
+# Type 8.0: High synchrony - directed motion absent
 
 # -----------------------------------------------------------------------------------
 #Load Required Packages
