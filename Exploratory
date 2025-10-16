@@ -1,0 +1,1618 @@
+# ------------------------------------------------------------------------------
+# Analysis Version 1
+# ------------------------------------------------------------------------------
+
+# Model: s ~ Synchrony * Directed_Motion + (1 | participant)
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1
+#    i.e., drop big opposite (s < 0) and big overshoot (s > 1).
+# 5) Keep all advice-gap magnitudes |X − R1| (including < 25 units); 
+# no gap-based exclusions.
+
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Parameters
+tiny <- 2           # "≤ 2 units" tolerance for tiny moves/overshoots
+
+# Recode & drop random 
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%   # Rule 1
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# Apply Rules 2 & 3 
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,            # distance to advice
+    num       = R2 - R1,           # movement on second response
+    equal_RX  = (R1 == X),         # Rule 2: exact equality -> drop later
+    
+    # Direction helpers
+    toward    = sign(denom) * num >= 0,          # moved toward (or stayed)
+    away      = sign(denom) * num <  0,          # moved away
+    overshoot = sign(denom) * (R2 - X) > 0,      # ended past X in the same direction
+    
+    # Magnitudes
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    # Tiny-move flags per your rules
+    small_overshoot = overshoot & (overshoot_mag <= tiny),        # Rule 3(i)
+    small_overall   = move_mag <= tiny,                           # Rule 3(ii)
+    small_opposite  = away & (move_mag <= tiny)                   # (covered by small_overall, kept for clarity)
+  ) %>%
+  filter(!equal_RX)  # Rule 2
+
+# Adjust R2 (Rule 3): tiny overshoot -> clamp to X; tiny overall/opposite -> clamp to R1
+prep <- prep %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                  ~ X,
+      small_overall | small_opposite   ~ R1,
+      TRUE                             ~ R2
+    )
+  )
+
+# Compute s and keep only 0..1 (Rule 4). Keep ALL advice gaps (Rule 5)
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%
+  select(participant, Directed_Motion, Synchrony, s)
+
+stopifnot(nrow(s_df) > 0)
+
+# Quick summary of the analysis set 
+cat("\nAnalysis rows kept:", nrow(s_df), "\n")
+cell_summary <- s_df %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(n = n(), mean_s = mean(s), sd_s = sd(s), .groups = "drop")
+print(cell_summary)
+
+# Effect coding (sum contrasts) 
+# Interpret fixed-effect main effects as deviations from the grand mean.
+contrasts(s_df$Directed_Motion) <- contr.sum(2)   # Present, Absent
+contrasts(s_df$Synchrony)       <- contr.sum(3)   # High, Medium, Low
+
+# (A) Linear mixed-effects model (Gaussian) 
+m_lmm <- lmer(s ~ Synchrony * Directed_Motion + (1 | participant), data = s_df)
+cat("\n--- Linear mixed model (lmer) ---\n")
+print(summary(m_lmm))
+cat("\nType-III (Satterthwaite) tests:\n")
+print(anova(m_lmm, type = 3))
+
+# (B) Beta mixed-effects model (preferred for 0..1 outcomes) ---
+# Beta family cannot take exact 0 or 1, but we kept 0<=s<=1. Apply Smithson-Verkuilen "squeeze".
+N <- nrow(s_df)
+s_df <- s_df %>%
+  mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+m_beta <- glmmTMB(
+  s_beta ~ Synchrony * Directed_Motion + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = s_df
+)
+cat("\n--- Beta mixed model (glmmTMB) ---\n")
+print(summary(m_beta))
+
+# Likelihood-ratio tests (approx Type-II/III). Type-III via drop1 with full model:
+cat("\nDrop1 (LRT) on beta model:\n")
+print(drop1(m_beta, test = "Chisq"))
+
+## (re)fit linear mixed model by ML
+m_lmm_ml <- lmer(s ~ Synchrony * Directed_Motion + (1 | participant),
+                 data = s_df, REML = FALSE)
+
+## beta mixed model you already fit as m_beta on s_df$s_beta
+
+# AIC table + ΔAIC + Akaike weights
+aics <- AIC(m_lmm_ml, m_beta)
+aics$delta  <- aics$AIC - min(aics$AIC)
+aics$weight <- exp(-0.5 * aics$delta) / sum(exp(-0.5 * aics$delta))
+aics
+
+# ------------------------------------------------------------------------------
+# Analysis Version 2
+# ------------------------------------------------------------------------------
+
+# Model: s ~ Synchrony * Directed_Motion + (1 | participant)
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1
+#    i.e., drop big opposite (s < 0) and big overshoot (s > 1).
+# 5) Keep ONLY advice-gap magnitudes |X − R1| of 25 units
+
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Parameters 
+tiny     <- 2      # "≤ 2 units" tolerance for tiny moves/overshoots
+gap_target <- 25   # keep only advice gaps of 25 slider units
+gap_tol    <- 0.5  # tolerance around 25; set to 0 for exact 25
+
+# Recode, drop random, coerce numerics 
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# Apply Rules 2–3 (drop R1==X; tiny adjustments to R2) 
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,                    # distance to advice
+    num       = R2 - R1,                   # movement on second response
+    equal_RX  = (R1 == X),                 # Rule 2: exact equality -> drop later
+    
+    # Direction helpers
+    toward    = sign(denom) * num >= 0,    # moved toward (or stayed)
+    away      = sign(denom) * num <  0,    # moved away
+    overshoot = sign(denom) * (R2 - X) > 0,# ended past X in the same direction
+    
+    # Magnitudes
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    # Tiny-move flags per your rules
+    small_overshoot = overshoot & (overshoot_mag <= tiny),      # Rule 3(i)
+    small_overall   = move_mag <= tiny,                         # Rule 3(ii)
+    small_opposite  = away & (move_mag <= tiny)                 # (redundant given small_overall)
+  ) %>%
+  filter(!equal_RX)  # Rule 2
+
+# Adjust R2 (Rule 3)
+prep <- prep %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                  ~ X,   # tiny overshoot -> clamp to X
+      small_overall | small_opposite   ~ R1,  # tiny overall/opposite -> clamp to R1
+      TRUE                             ~ R2
+    )
+  )
+
+# Compute s and keep only 0..1 (Rule 4) 
+s_all <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1)
+
+# Keep ONLY |X − R1| ≈ 25 units (Rule 5) 
+s_25 <- s_all %>%
+  mutate(abs_gap = abs(X - R1)) %>%
+  filter(abs(abs_gap - gap_target) <= gap_tol)
+
+stopifnot(nrow(s_25) > 0)
+
+# Effect coding (sum contrasts) 
+contrasts(s_25$Directed_Motion) <- contr.sum(2)
+contrasts(s_25$Synchrony)       <- contr.sum(3)
+
+#  Smithson–Verkuilen squeeze for beta 
+N <- nrow(s_25)
+s_25 <- s_25 %>%
+  mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# Fit beta mixed-effects model 
+m_beta_25 <- glmmTMB(
+  s_beta ~ Synchrony * Directed_Motion + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = s_25
+)
+
+cat("\n--- Beta mixed model (|X − R1| ≈ 25) ---\n")
+print(summary(m_beta_25))
+cat("\nDrop1 (LRT) for interaction/main effects:\n")
+print(drop1(m_beta_25, test = "Chisq"))
+
+# Per-cell counts/means (sanity check) 
+cell_summary_25 <- s_25 %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(n = n(), mean_s = mean(s), sd_s = sd(s), .groups = "drop")
+print(cell_summary_25)
+
+# ------------------------------------------------------------------------------
+# Analysis Version 3
+# ------------------------------------------------------------------------------
+
+# Model: s_beta ~ Synchrony * Directed_Motion + (1 | participant)
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1 AND overshoots (s > 1).
+#    ONLY drop big opposite (s < 0) 
+# 5) Keep all advice-gap magnitudes |X − R1| 
+
+output_dir <- "Output"
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+
+# Read
+dat <- readr::read_csv(infile, show_col_types = FALSE)
+
+# Parameters
+tiny <- 2  # tolerance for "tiny" move/overshoot in slider units
+
+
+# Coerce, recode, drop 'random'
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%   # Rule 1
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+n_random_dropped <- sum(tolower(trimws(as.character(dat$feedback_type))) == "random", na.rm = TRUE)
+cat("Dropped due to random feedback:", n_random_dropped, "\n")
+
+
+# Apply Rules 2–3 (drop R1==X; tiny adjustments)
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,          # advice distance
+    num       = R2 - R1,         # observed movement
+    equal_RX  = (R1 == X),       # Rule 2
+    # direction helpers
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    # magnitudes
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    # tiny-move flags per your rules
+    small_overshoot = overshoot & (overshoot_mag <= tiny),      # Rule 3(i)
+    small_overall   = move_mag <= tiny,                         # Rule 3(ii)
+    small_opposite  = away & (move_mag <= tiny)                 # (redundant but explicit)
+  )
+
+n_equal_rx <- sum(prep$equal_RX, na.rm = TRUE)
+cat("Dropped (R1 == X):", n_equal_rx, "\n")
+
+prep <- prep %>% filter(!equal_RX)
+
+# Adjust R2 per Rule 3
+prep <- prep %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                  ~ X,   # tiny overshoot -> clamp to X
+      small_overall | small_opposite   ~ R1,  # tiny overall or tiny opposite -> clamp to R1
+      TRUE                             ~ R2
+    ),
+    # labels for adjustment summary
+    adj_reason = case_when(
+      small_overshoot                    ~ "Adjusted: tiny overshoot (R2:=X)",
+      small_overall & !small_opposite    ~ "Adjusted: tiny overall (R2:=R1)",
+      small_opposite                     ~ "Adjusted: tiny opposite (R2:=R1)",
+      TRUE                               ~ "No small adjustment"
+    )
+  )
+
+cat("\nAdjustment summary:\n")
+print(prep %>% count(adj_reason) %>% arrange(desc(n)))
+
+
+# Compute s and apply Rule 4 (keep s>=0; allow s>1)
+
+s_df_all <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s))
+
+# Keep: s >= 0 (includes 0..1 AND overshoots s>1), drop only s < 0
+n_opposite_dropped <- sum(s_df_all$s < 0, na.rm = TRUE)
+cat("Dropped big opposite (s < 0):", n_opposite_dropped, "\n")
+
+s_df <- s_df_all %>%
+  filter(s >= 0) %>%
+  select(participant, Directed_Motion, Synchrony, s)
+
+stopifnot(nrow(s_df) > 0)
+cat("Analysis rows kept:", nrow(s_df), "\n")
+
+# Quick cell means (helpful sanity check)
+cell_summary <- s_df %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(n = n(), mean_s = mean(s), sd_s = sd(s), .groups = "drop")
+cat("\nCell summary (n, mean_s, sd_s):\n"); print(cell_summary)
+
+
+# 3) Mixed model with effect coding (Gaussian LMM; overshoots allowed)
+
+# Effect coding (sum contrasts): interpret main effects as deviations from grand mean
+contrasts(s_df$Directed_Motion) <- contr.sum(2)
+contrasts(s_df$Synchrony)       <- contr.sum(3)
+
+m_lmm <- lmer(s ~ Synchrony * Directed_Motion + (1 | participant), data = s_df)
+
+cat("\n--- Linear mixed model (s allows overshoots) ---\n")
+print(summary(m_lmm))
+
+cat("\nType-III (Satterthwaite) tests:\n")
+print(anova(m_lmm, type = 3))
+
+# ------------------------------------------------------------
+# Analysis Version 4
+# ------------------------------------------------------------
+
+# Including advice direction as a fixed factor
+# Model: s ~ Advice_Direction * Directed_Motion * Synchrony + (1 | participant)
+
+# Social-information use by Advice Direction (Over vs Under)
+# Rules:
+# 1) Exclude feedback_type == "random"
+# 2) Drop R1 == X
+# 3) Adjust R2:
+#    (i) tiny overshoot (|R2−X| ≤ 2)  → R2_adj = X
+#    (ii) tiny overall move (|R2−R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1); keep only 0 ≤ s ≤ 1
+# 5) Keep all |X − R1| magnitudes (no gap-based exclusions)
+
+# Data + rules
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- readr::read_csv(infile, show_col_types = FALSE)
+
+tiny <- 2     # ≤2 units tolerance
+eps  <- 1e-8  # safety for division
+
+# Recode, drop random; coerce numerics; keep only over/under groups
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    ),
+    Advice_Direction = case_when(
+      feedback_type_clean == "over"  ~ "Overestimate",
+      feedback_type_clean == "under" ~ "Underestimate",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%  # Rule 1
+  filter(!is.na(Advice_Direction)) %>%
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low")),
+    Advice_Direction= factor(Advice_Direction,levels = c("Overestimate","Underestimate"))
+  )
+
+# Apply Rules 2 & 3
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,                       # distance to advice
+    num       = R2 - R1,                      # movement on second response
+    equal_RX  = (R1 == X),                    # Rule 2: exact equality -> drop later
+    
+    # Direction helpers
+    toward    = sign(denom) * num >= 0,       # moved toward/stayed
+    away      = sign(denom) * num <  0,       # moved away
+    overshoot = sign(denom) * (R2 - X) > 0,   # ended past X
+    
+    # Magnitudes
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    # Tiny-move flags (Rule 3)
+    small_overshoot = overshoot & (overshoot_mag <= tiny),     # clamp to X
+    small_overall   = move_mag <= tiny,                        # clamp to R1
+    small_opposite  = away & (move_mag <= tiny)                # (covered by small_overall)
+  ) %>%
+  filter(!equal_RX) %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                  ~ X,   # Rule 3(i)
+      small_overall | small_opposite   ~ R1,  # Rule 3(ii)
+      TRUE                             ~ R2
+    )
+  )
+
+# Compute s and keep only 0..1 (Rule 4). No gap-based exclusions (Rule 5)
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%
+  select(participant, Advice_Direction, Directed_Motion, Synchrony, s)
+
+stopifnot(nrow(s_df) > 0)
+
+# Quick cell counts (sanity check)
+print(
+  s_df %>%
+    count(Advice_Direction, Directed_Motion, Synchrony, name = "n_trials") %>%
+    arrange(Advice_Direction, Directed_Motion, Synchrony)
+)
+
+# Smithson–Verkuilen squeeze (maps [0,1] to (0,1))
+N <- nrow(s_df)
+s_df <- s_df %>%
+  mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# Sum contrasts: interpret main effects as deviations from grand mean
+contrasts(s_df$Advice_Direction) <- contr.sum(2)
+contrasts(s_df$Directed_Motion)  <- contr.sum(2)
+contrasts(s_df$Synchrony)        <- contr.sum(3)
+
+# Fit full 3-way interaction model
+m_beta_dir <- glmmTMB(
+  s_beta ~ Advice_Direction * Directed_Motion * Synchrony + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = s_df
+)
+
+cat("\n--- Beta mixed model (Advice x Motion x Synchrony) ---\n")
+print(summary(m_beta_dir))
+
+# Type-III-like tests via single-term deletions (LRT)
+cat("\n--- Likelihood-ratio tests (drop1) ---\n")
+print(drop1(m_beta_dir, test = "Chisq"))
+
+# Optional: marginal means (back-transformed to response scale)
+emm <- emmeans(m_beta_dir, ~ Advice_Direction * Directed_Motion * Synchrony, type = "response")
+print(emm)
+
+# Examples of simple-effects contrasts:
+# Advice_Direction differences within each Motion x Synchrony cell
+print(contrast(emm, method = "revpairwise", by = c("Directed_Motion","Synchrony")))
+# Directed_Motion differences within each Advice x Synchrony cell
+print(contrast(emm, method = "revpairwise", by = c("Advice_Direction","Synchrony")))
+# Synchrony pairwise within each Advice x Motion cell (Bonferroni adjust)
+print(contrast(emm, method = "pairwise", by = c("Advice_Direction","Directed_Motion"), adjust = "bonferroni"))
+
+# 1) EMMs for Advice_Direction × Directed_Motion, averaged over Synchrony
+emm_ADDM <- emmeans(
+  m_beta_dir,
+  ~ Advice_Direction * Directed_Motion,
+  weights = "proportional",  # use "equal" if you want equal-cell averaging
+  type = "link"              # work on the logit (link) scale for tests
+)
+
+# 2) Simple effects of Advice Direction within each Directed Motion
+AD_within_DM <- pairs(emm_ADDM, by = "Directed_Motion",
+                      adjust = "holm", type = "link")
+AD_within_DM
+# Back-transformed (on response scale) if you want ORs:
+pairs(emm_ADDM, by = "Directed_Motion", adjust = "holm", type = "response")
+
+# 3) Simple effects of Directed Motion within each Advice Direction
+DM_within_AD <- pairs(emm_ADDM, by = "Advice_Direction",
+                      adjust = "holm", type = "link")
+DM_within_AD
+# Back-transformed:
+pairs(emm_ADDM, by = "Advice_Direction", adjust = "holm", type = "response")
+
+# 4) Re-state the 2×2 interaction (diff-of-diffs) as a single contrast
+# Construct the contrast matrix programmatically to avoid cell-order mistakes:
+K <- list("AD × DM (diff-of-diffs)" = c( 1, -1,  -1,  1))
+# The order c(Over-Present, Under-Present, Over-Absent, Under-Absent)
+# is the default for ~ Advice_Direction * Directed_Motion with AD first.
+contrast(emm_ADDM, K, type = "link")
+contrast(emm_ADDM, K, type = "response")  # OR on response scale
+
+# 5) (Optional) Simple effects within each Synchrony level instead of averaging
+emm_by_S <- emmeans(
+  m_beta_dir,
+  ~ Advice_Direction * Directed_Motion | Synchrony,
+  type = "link"
+)
+pairs(emm_by_S, by = c("Synchrony","Directed_Motion"), adjust = "holm")  # AD within DM, per Synchrony
+pairs(emm_by_S, by = c("Synchrony","Advice_Direction"), adjust = "holm")  # DM within AD, per Synchrony
+
+# ------------------------------------------------------------
+# Analysis Version 5
+# ------------------------------------------------------------
+
+# Including advice direction as a fixed factor
+# Model: s ~ Advice_Direction * Directed_Motion * Synchrony + (1 | participant)
+# Exact 25 advice gap 
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- readr::read_csv(infile, show_col_types = FALSE)
+
+tiny <- 2     # ≤2 units tolerance for tiny overshoot/overall/opposite
+eps  <- 1e-8  # safety for division
+
+# Recode, drop 'random', coerce numerics, build Advice_Direction
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    ),
+    Advice_Direction = case_when(
+      feedback_type_clean == "over"  ~ "Overestimate",
+      feedback_type_clean == "under" ~ "Underestimate",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%  # Rule 1
+  filter(!is.na(Advice_Direction)) %>%
+  mutate(
+    Directed_Motion  = factor(Directed_Motion,  levels = c("Present","Absent")),
+    Synchrony        = factor(Synchrony,        levels = c("High","Medium","Low")),
+    Advice_Direction = factor(Advice_Direction, levels = c("Overestimate","Underestimate")),
+    abs_gap = abs(X - R1)
+  ) %>%
+  
+  # ---- EXACT 25-unit advice gap ----
+filter(dplyr::near(abs_gap, 25))   # replace with `abs_gap == 25` for strict equality
+
+cat("Trials with |X - R1| = 25 exactly: ", nrow(dat_si), "\n", sep = "")
+
+# Apply Rules 2 & 3 (drop R1==X; clamp tiny overshoot/overall/opposite)
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    equal_RX  = (R1 == X),                              # Rule 2
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    small_overshoot = overshoot & (overshoot_mag <= tiny),
+    small_overall   = move_mag <= tiny,
+    small_opposite  = away & (move_mag <= tiny)
+  ) %>%
+  filter(!equal_RX) %>%
+  mutate(
+    R2_adj = dplyr::case_when(
+      small_overshoot                     ~ X,   # clamp to X
+      small_overall | small_opposite      ~ R1,  # clamp to R1
+      TRUE                                ~ R2
+    )
+  )
+
+# Compute s and keep only 0..1 (Rule 4). No further gap exclusions (Rule 5 already applied)
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%
+  select(participant, Advice_Direction, Directed_Motion, Synchrony, s)
+
+stopifnot(nrow(s_df) > 0)
+
+# Quick cell counts
+print(
+  s_df %>%
+    count(Advice_Direction, Directed_Motion, Synchrony, name = "n_trials") %>%
+    arrange(Advice_Direction, Directed_Motion, Synchrony)
+)
+
+# Smithson–Verkuilen squeeze
+N <- nrow(s_df)
+s_df <- s_df %>%
+  mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# Sum contrasts
+contrasts(s_df$Advice_Direction) <- contr.sum(2)
+contrasts(s_df$Directed_Motion)  <- contr.sum(2)
+contrasts(s_df$Synchrony)        <- contr.sum(3)
+
+# Beta mixed model
+m_beta_dir <- glmmTMB(
+  s_beta ~ Advice_Direction * Directed_Motion * Synchrony + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = s_df
+)
+
+cat("\n--- Beta mixed model (Advice × Motion × Synchrony), |X-R1|=25 ---\n")
+print(summary(m_beta_dir))
+
+cat("\n--- Likelihood-ratio tests (drop1) ---\n")
+print(drop1(m_beta_dir, test = "Chisq"))
+
+# Marginal means & contrasts
+emm <- emmeans(m_beta_dir, ~ Advice_Direction * Directed_Motion * Synchrony, type = "response")
+print(emm)
+
+# Advice differences within Motion × Synchrony
+#print(contrast(emm, method = "revpairwise", by = c("Directed_Motion","Synchrony")))
+# Motion differences within Advice × Synchrony
+#print(contrast(emm, method = "revpairwise", by = c("Advice_Direction","Synchrony")))
+# Synchrony pairwise within Advice × Motion
+#print(contrast(emm, method = "pairwise", by = c("Advice_Direction","Directed_Motion"), adjust = "bonferroni"))
+
+# Averaged over Synchrony (proportional cell weights)
+emm_ADDM <- emmeans(
+  m_beta_dir,
+  ~ Advice_Direction * Directed_Motion,
+  weights = "proportional",
+  type = "link"
+)
+
+# Averaged over Synchrony (proportional cell weights)
+emm_ADSY <- emmeans(
+  m_beta_dir,
+  ~ Advice_Direction * Synchrony,
+  weights = "proportional",
+  type = "link"
+)
+
+# Simple effects
+AD_within_DM <- pairs(emm_ADDM, by = "Directed_Motion", adjust = "holm", type = "link"); AD_within_DM
+pairs(emm_ADDM, by = "Directed_Motion", adjust = "holm", type = "response")
+
+DM_within_AD <- pairs(emm_ADDM, by = "Advice_Direction", adjust = "holm", type = "link"); DM_within_AD
+pairs(emm_ADDM, by = "Advice_Direction", adjust = "holm", type = "response")
+
+AD_within_SY <- pairs(emm_ADSY, by = "Synchrony", adjust = "holm", type = "link"); AD_within_SY
+pairs(emm_ADSY, by = "Synchrony", adjust = "holm", type = "response")
+
+SY_within_AD <- pairs(emm_ADSY, by = "Advice_Direction", adjust = "holm", type = "link"); DM_within_AD
+pairs(emm_ADSY, by = "Advice_Direction", adjust = "holm", type = "response")
+
+
+# 2×2 interaction (diff-of-diffs)
+K <- list("AD × DM (diff-of-diffs)" = c( 1, -1,  -1,  1))  # Over-Present, Under-Present, Over-Absent, Under-Absent
+contrast(emm_ADDM, K, type = "link")
+contrast(emm_ADDM, K, type = "response")
+
+
+# ------------------------------------------------------------
+# Analysis Version 5
+# ------------------------------------------------------------
+
+# Including confidence as a fixed factor
+# Model: s ~ Advice_Direction * Directed_Motion * Synchrony + (1 | participant)
+# Exact 25 advice gap 
+
+output_dir <- "Output"
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+stopifnot(file.exists(infile))
+
+tiny <- 2  # tolerance for tiny moves/overshoots
+has_col <- function(df, nm) nm %in% names(df)
+
+# ======================= Load & Rule 1 ==================
+dat <- read_csv(infile, show_col_types = FALSE)
+
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    ),
+    participant = factor(participant)
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%   # Rule 1
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# ======================= Confidence (original units) ==========================
+# Use dedicated confidence if you have it; otherwise fall back to |R1|
+if (has_col(dat_si, "slider_confidence.response")) {
+  conf_raw <- suppressWarnings(as.numeric(dat_si$`slider_confidence.response`))
+  conf_strength <- pmax(pmin(abs(conf_raw), 100), 0)   # clamp to 0..100 just in case
+} else {
+  conf_strength <- pmax(pmin(abs(dat_si$R1), 100), 0)  # proxy: absolute initial slider (0..100)
+}
+dat_si <- dat_si %>%
+  mutate(
+    conf_strength = conf_strength,                  # 0..100 (original units)
+    z_conf = as.numeric(scale(conf_strength))       # z for modeling
+  )
+
+# ======================= Rules 2–3: adjust R2 ================================
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,                 # distance to advice
+    num       = R2 - R1,                # movement on second response
+    equal_RX  = (R1 == X),              # Rule 2: drop later
+    
+    # helpers
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    small_overshoot = overshoot & (overshoot_mag <= tiny),  # Rule 3(i)
+    small_overall   = move_mag <= tiny,                     # Rule 3(ii)
+    small_opposite  = away & (move_mag <= tiny)
+  ) %>%
+  filter(!equal_RX) %>%                                    # Rule 2
+  mutate(
+    R2_adj = case_when(                                    # Rule 3
+      small_overshoot                ~ X,
+      small_overall | small_opposite ~ R1,
+      TRUE                           ~ R2
+    )
+  )
+
+# ======================= Rules 4–5: compute s ================================
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%               # Rule 4
+  select(participant, Directed_Motion, Synchrony, s,     # Rule 5 (keep all gaps)
+         conf_strength, z_conf, dplyr::any_of(c("stimulus_id")))
+
+stopifnot(nrow(s_df) > 0)
+
+# Smithson–Verkuilen squeeze for beta GLMM support
+N <- nrow(s_df)
+s_df <- s_df %>% mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# ======================= Fit model (beta GLMM) ===============================
+# Random intercept + optional slope for z_conf
+re_stim <- if ("stimulus_id" %in% names(s_df)) " + (1 | stimulus_id)" else ""
+form_base <- as.formula(paste0(
+  "s_beta ~ z_conf + Synchrony * Directed_Motion + (1 + z_conf | participant)",
+  re_stim
+))
+
+m_beta_conf <- glmmTMB(
+  formula = form_base,
+  family  = beta_family(link = "logit"),
+  data    = s_df
+)
+
+# ======================= Predict & Plot in ORIGINAL units =====================
+# Use the SAME mean/SD used to build z_conf (computed on the analysis set)
+mu_c <- mean(s_df$conf_strength, na.rm = TRUE)
+sd_c <- sd(s_df$conf_strength,  na.rm = TRUE)
+
+# Grid on original units (0..100). If your confidence scale is different, adjust here.
+conf_grid <- seq(0, 100, by = 1)
+
+# Build newdata across confidence × all factor combos (equal weights for factors)
+newdat <- expand_grid(
+  conf_strength = conf_grid,
+  Synchrony = levels(s_df$Synchrony),
+  Directed_Motion = levels(s_df$Directed_Motion)
+) %>%
+  mutate(z_conf = (conf_strength - mu_c) / sd_c)
+
+# Fixed-effects predictions (response scale) + 95% CI using fixed-effect covariance
+bet <- fixef(m_beta_conf)$cond
+V   <- vcov(m_beta_conf)$cond
+X   <- model.matrix(~ z_conf + Synchrony * Directed_Motion, data = newdat)
+
+eta <- as.numeric(X %*% bet)                                # linear predictor
+se  <- sqrt(rowSums((X %*% V) * X))                         # diag(X V X^T)
+mu     <- plogis(eta)                                       # mean on (0,1)
+mu_lo  <- plogis(eta - 1.96 * se)
+mu_hi  <- plogis(eta + 1.96 * se)
+
+curve_df <- newdat %>%
+  mutate(predicted = mu, conf.low = mu_lo, conf.high = mu_hi) %>%
+  group_by(conf_strength) %>%                                # marginalize over factors
+  summarise(predicted = mean(predicted),
+            conf.low  = mean(conf.low),
+            conf.high = mean(conf.high),
+            .groups   = "drop")
+
+p_effect <- ggplot() +
+  # Model CI ribbon (uses curve_df)
+  geom_ribbon(
+    data = curve_df,
+    aes(x = conf_strength, ymin = conf.low, ymax = conf.high),
+    alpha = 0.18,
+    inherit.aes = FALSE
+  ) +
+  # Model mean line
+  geom_line(
+    data = curve_df,
+    aes(x = conf_strength, y = predicted),
+    linewidth = 1.1,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = emp,
+    aes(x = conf_mid, y = s_mean),
+    size = 2,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    x = "Confidence strength (abs slider, 0–100)",
+    y = "Social information weight s (0–1)",
+    title = "Higher confidence → lower social-information weight"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_effect)
+
+# Save
+ggsave(file.path(output_dir, "conf_effect_original_units.png"),
+       p_effect, width = 7, height = 5, dpi = 300, bg = "white")
+
+---
+  
+  output_dir <- "Output"
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+stopifnot(file.exists(infile))
+
+tiny <- 2  # tolerance for tiny moves/overshoots
+has_col <- function(df, nm) nm %in% names(df)
+
+# ======================= Load & Rule 1 ==================
+dat <- read_csv(infile, show_col_types = FALSE)
+
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    ),
+    participant = factor(participant)
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%   # Rule 1
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# ======================= Confidence (original units) ==========================
+# Use dedicated confidence if present; otherwise abs(R1)
+if (has_col(dat_si, "slider_confidence.response")) {
+  conf_raw <- suppressWarnings(as.numeric(dat_si$`slider_confidence.response`))
+  conf_strength <- pmax(pmin(abs(conf_raw), 100), 0)   # 0..100
+} else {
+  conf_strength <- pmax(pmin(abs(dat_si$R1), 100), 0)  # 0..100
+}
+dat_si <- dat_si %>%
+  mutate(
+    conf_strength = conf_strength,                  # original units for plotting
+    z_conf = as.numeric(scale(conf_strength))       # z for modeling
+  )
+
+# ======================= Rules 2–3: adjust R2 ================================
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    equal_RX  = (R1 == X),
+    
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    small_overshoot = overshoot & (overshoot_mag <= tiny),  # Rule 3(i)
+    small_overall   = move_mag <= tiny,                     # Rule 3(ii)
+    small_opposite  = away & (move_mag <= tiny)
+  ) %>%
+  filter(!equal_RX) %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                ~ X,
+      small_overall | small_opposite ~ R1,
+      TRUE                           ~ R2
+    )
+  )
+
+# ======================= Rules 4–5: compute s ================================
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%               # Rule 4
+  select(participant, Directed_Motion, Synchrony, s,
+         conf_strength, z_conf, dplyr::any_of(c("stimulus_id")))
+
+stopifnot(nrow(s_df) > 0)
+
+# Smithson–Verkuilen squeeze for beta GLMM support
+N <- nrow(s_df)
+s_df <- s_df %>% mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# ======================= Fit model (beta GLMM) ===============================
+re_stim <- if ("stimulus_id" %in% names(s_df)) " + (1 | stimulus_id)" else ""
+form_base <- as.formula(paste0(
+  "s_beta ~ z_conf + Synchrony * Directed_Motion + (1 + z_conf | participant)",
+  re_stim
+))
+
+m_beta_conf <- glmmTMB(
+  formula = form_base,
+  family  = beta_family(link = "logit"),
+  data    = s_df
+)
+
+# ======================= Predict in ORIGINAL units by condition ===============
+# Use the SAME mean/SD as used to create z_conf
+mu_c <- mean(s_df$conf_strength, na.rm = TRUE)
+sd_c <- sd(s_df$conf_strength,  na.rm = TRUE)
+
+conf_grid <- seq(0, 100, by = 1)  # x-axis in original units
+
+# Full grid for all Synchrony × Directed_Motion combinations (separate lines)
+newdat <- expand_grid(
+  conf_strength = conf_grid,
+  Synchrony = levels(s_df$Synchrony),
+  Directed_Motion = levels(s_df$Directed_Motion)
+) %>%
+  mutate(z_conf = (conf_strength - mu_c) / sd_c)
+
+# Fixed-effect predictions (response scale) with 95% CI
+bet <- fixef(m_beta_conf)$cond
+V   <- vcov(m_beta_conf)$cond
+X   <- model.matrix(~ z_conf + Synchrony * Directed_Motion, data = newdat)
+
+eta <- as.numeric(X %*% bet)
+se  <- sqrt(rowSums((X %*% V) * X))
+mu     <- plogis(eta)
+mu_lo  <- plogis(eta - 1.96 * se)
+mu_hi  <- plogis(eta + 1.96 * se)
+
+curve_df <- newdat %>%
+  mutate(predicted = mu, conf.low = mu_lo, conf.high = mu_hi)
+
+# ======================= Plot: lines by Synchrony, facets by Directed Motion ==
+sync_cols <- c("High"="orange", "Medium"="grey60", "Low"="darkgreen")
+
+p_effect <- ggplot() +
+  # CI ribbons per Synchrony line
+  geom_ribbon(
+    data = curve_df,
+    aes(x = conf_strength, ymin = conf.low, ymax = conf.high, fill = Synchrony),
+    alpha = 0.12, inherit.aes = FALSE
+  ) +
+  # Model-implied lines
+  geom_line(
+    data = curve_df,
+    aes(x = conf_strength, y = predicted, color = Synchrony),
+    linewidth = 1.1, inherit.aes = FALSE
+  ) +
+  facet_wrap(~ Directed_Motion, nrow = 1) +
+  scale_color_manual(values = sync_cols, breaks = c("High","Medium","Low")) +
+  scale_fill_manual(values = sync_cols, breaks = c("High","Medium","Low")) +
+  labs(
+    x = "Confidence Strength (0–100)",
+    y = "Social Information Use, s (0–1)",
+    color = "Synchrony", fill = "Synchrony",
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.spacing.x = unit(14, "pt")
+  )
+
+print(p_effect)
+
+ggsave(file.path(output_dir, "conf_effect_by_DM_Sync_MODEL_ONLY.png"),
+       p_effect, width = 9, height = 5, dpi = 300, bg = "white")
+
+----
+  
+  output_dir <- "Output"
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+tiny <- 2
+has_col <- function(df, nm) nm %in% names(df)
+
+dat_si <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    ),
+    participant = factor(participant)
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# Confidence strength in original units (0–100); use dedicated column if you have it
+if (has_col(dat_si, "slider_confidence.response")) {
+  conf_raw <- suppressWarnings(as.numeric(dat_si$`slider_confidence.response`))
+  conf_strength <- pmax(pmin(abs(conf_raw), 100), 0)
+} else {
+  conf_strength <- pmax(pmin(abs(dat_si$R1), 100), 0) # proxy from |R1|
+}
+dat_si <- dat_si %>% mutate(conf_strength = conf_strength)
+
+# Apply Rules 2 & 3 to adjust R2
+prep <- dat_si %>%
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    equal_RX  = (R1 == X),
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    small_overshoot = overshoot & (overshoot_mag <= tiny),
+    small_overall   = move_mag <= tiny,
+    small_opposite  = away & (move_mag <= tiny)
+  ) %>%
+  filter(!equal_RX) %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot                ~ X,
+      small_overall | small_opposite ~ R1,
+      TRUE                           ~ R2
+    )
+  )
+
+# Compute s and keep 0..1
+s_df <- prep %>%
+  mutate(s = (R2_adj - R1) / (X - R1)) %>%
+  filter(is.finite(s), s >= 0, s <= 1) %>%
+  # Keep R1, X to build advice_dir / initial_yes
+  select(participant, Directed_Motion, Synchrony, s, R1, X, conf_strength)
+
+stopifnot(nrow(s_df) > 0)
+
+# --- Build the 5 predictors exactly as requested ---
+s_df <- s_df %>%
+  mutate(
+    advice_dir   = factor(ifelse(X > R1, "Over", "Under"), levels = c("Under","Over")), # 3)
+    conf01       = conf_strength / 100,      # 4) confidence as 0–1 (keeps 0–100 meaning)
+    initial_yes  = factor(ifelse(R1 > 0, "Yes","No"), levels = c("No","Yes")), # 5) binary initial
+  )
+
+# Smithson–Verkuilen squeeze for beta
+N <- nrow(s_df)
+s_df <- s_df %>% mutate(s_beta = (s * (N - 1) + 0.5) / N)
+
+# Contrast coding (optional but useful)
+contrasts(s_df$Directed_Motion) <- contr.sum(2)
+contrasts(s_df$Synchrony)       <- contr.sum(3)
+contrasts(s_df$advice_dir)      <- contr.sum(2)
+contrasts(s_df$initial_yes)     <- contr.sum(2)
+
+# ---------- Model: include all five as main effects ----------
+m_all <- glmmTMB(
+  s_beta ~ Directed_Motion * Synchrony * advice_dir * conf01 * initial_yes *
+    (1 | participant),
+  data = s_df,
+  family = beta_family(link = "logit")
+)
+
+summary(m_all)
+
+# ---------- Model: include all five as main effects ----------
+m_all <- glmmTMB(
+  s_beta ~ Directed_Motion * Synchrony * advice_dir +
+    (1 | participant),
+  data = s_df,
+  family = beta_family(link = "logit")
+)
+
+# ---------- Model: include all five as main effects ----------
+m_all <- glmmTMB(
+  s_beta ~ Directed_Motion * Synchrony * conf01 +
+    (1 | participant),
+  data = s_df,
+  family = beta_family(link = "logit")
+)
+
+# ---------- Model: include all five as main effects ----------
+m_all <- glmmTMB(
+  s_beta ~ Directed_Motion * Synchrony * advice_dir +
+    (1 | participant),
+  data = s_df,
+  family = beta_family(link = "logit")
+  
+  
+  # ------------------------------------------------------------------------------
+  # Analysis 4: Primary Model Social Influence
+  # SIU ~ Synchrony * Directed Motion * Advice Direction 
+  # ------------------------------------------------------------------------------
+  
+  infile <- file.path(output_dir, "siu_trials_clean.csv")
+  dat <- read_csv(infile, show_col_types = FALSE)
+  
+  # Build analysis df (reuse existing columns; light recode only) 
+  df <- dat %>%
+    mutate(
+      participant = factor(participant_ID),
+      s = as.numeric(s),
+      
+      Advice = case_when(
+        str_trim(tolower(as.character(feedback_type))) == "over"  ~ "Overestimate",
+        str_trim(tolower(as.character(feedback_type))) == "under" ~ "Underestimate",
+        TRUE ~ NA_character_
+      ),
+      Directed_Motion = case_when(
+        str_detect(tolower(as.character(directed_motion)), "present|\\bdp\\b") ~ "Present",
+        str_detect(tolower(as.character(directed_motion)), "absent|\\bda\\b")  ~ "Absent",
+        TRUE ~ NA_character_
+      ),
+      Synchrony = case_when(
+        str_detect(tolower(as.character(synchrony)), "high|\\bhs\\b|^h\\b")   ~ "High",
+        str_detect(tolower(as.character(synchrony)), "medium|\\bms\\b|^m\\b") ~ "Medium",
+        str_detect(tolower(as.character(synchrony)), "low|\\bls\\b|^l\\b")    ~ "Low",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(Advice), !is.na(Directed_Motion), !is.na(Synchrony), is.finite(s)) %>%
+    mutate(
+      Advice          = factor(Advice,          levels = c("Underestimate","Overestimate")),
+      Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+      Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+    )
+  
+  # Effect coding (sum-to-zero) 
+  options(contrasts = c("contr.sum","contr.poly"))
+  
+  # Smithson–Verkuilen squeeze so beta can use all rows 
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)  # maps [0,1] → (0,1)
+  
+  # Fit the 3-way model 
+  m3 <- glmmTMB(
+    s_sv ~ Synchrony * Directed_Motion * Advice + (1 | participant),
+    family = beta_family(link = "logit"),
+    data = df
+  )
+  summary(m3)
+  
+  
+  # ------------------------------------------------------------------------------
+  # Analysis 5: Exploratory Model Social Influence (Comparison)
+  # SIU ~ Confidence
+  # ------------------------------------------------------------------------------
+  
+  # Load cleaned SIU trials (already contains s and R2_adj etc.)
+  infile <- file.path(output_dir, "siu_trials_clean.csv")
+  dat <- read_csv(infile, show_col_types = FALSE)
+  
+  df <- dat %>%
+    mutate(
+      participant = factor(participant_ID),
+      r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      conf = pmin(pmax(abs(r1)/100, 0), 1),   # 0..1 confidence from R1
+      s    = as.numeric(s)
+    ) %>%
+    filter(is.finite(conf), is.finite(s))
+  
+  # (Optional) center confidence for easier intercept
+  df <- df %>% mutate(conf_c = conf - mean(conf, na.rm = TRUE))
+  
+  # Mixed-effects fractional logit
+  m_conf_fl <- glmmTMB(
+    s ~ conf_c + (1 | participant),
+    family = binomial(link = "logit"),
+    data   = df
+  )
+  summary(m_conf_fl)
+  
+  # Smithson–Verkuilen squeeze for DV only (maps [0,1] -> (0,1))
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+  
+  m_conf_beta <- glmmTMB(
+    s_sv ~ conf_c + (1 | participant),
+    family = beta_family(link = "logit"),
+    data   = df
+  )
+  summary(m_conf_beta)
+  
+  
+  # ------------------------------------------------------------------------------
+  # Analysis 6: Exploratory Model Social Influence (Comparison)
+  # SIU ~ Confidence X Advice Direction
+  # ------------------------------------------------------------------------------
+  
+  infile <- file.path(output_dir, "siu_trials_clean.csv")
+  dat <- read_csv(infile, show_col_types = FALSE)
+  
+  df <- dat %>%
+    mutate(
+      participant = factor(participant_ID),
+      s    = as.numeric(s),
+      r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      conf = pmin(pmax(abs(r1)/100, 0), 1),  # 0..1 confidence from R1
+      
+      Advice = case_when(
+        str_trim(tolower(as.character(feedback_type))) == "over"  ~ "Overestimate",
+        str_trim(tolower(as.character(feedback_type))) == "under" ~ "Underestimate",
+        TRUE ~ NA_character_
+      ),
+      Directed_Motion = case_when(
+        str_detect(tolower(as.character(directed_motion)), "present|\\bdp\\b") ~ "Present",
+        str_detect(tolower(as.character(directed_motion)), "absent|\\bda\\b")  ~ "Absent",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(Advice), !is.na(Directed_Motion), is.finite(s), is.finite(conf)) %>%
+    mutate(
+      Advice          = factor(Advice,          levels = c("Underestimate","Overestimate")),
+      Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent"))
+    )
+  
+  # --- Within–between decomposition of confidence ---
+  df <- df %>%
+    group_by(participant) %>%
+    mutate(
+      conf_b = mean(conf, na.rm = TRUE),   # between-person mean confidence
+      conf_w = conf - conf_b               # within-person deviation (trial-level)
+    ) %>%
+    ungroup()
+  
+  # Center conf_b so the intercept is interpretable
+  df <- df %>% mutate(conf_b_c = conf_b - mean(conf_b, na.rm = TRUE))
+  
+  # --- Smithson–Verkuilen squeeze (maps [0,1] -> (0,1)) for the DV only ---
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+  
+  # Effect coding (sum-to-zero) so intercepts are grand means
+  options(contrasts = c("contr.sum","contr.poly"))
+  
+  # --- Beta mixed model with the interaction of interest ---
+  # Include Directed_Motion as a covariate (since it mattered before);
+  # the key test is Advice:conf_w. conf_b_c adjusts for between-person differences.
+  m_confXadv <- glmmTMB(
+    s_sv ~ Advice * conf_w + conf_b_c +  (1 | participant),
+    family = beta_family(link = "logit"),
+    data   = df
+  )
+  summary(m_confXadv)
+  
+  # ------------------------------------------------------------------------------
+  # Analysis 5: Mediation 
+  # SIU ~ Confidence
+  # ------------------------------------------------------------------------------
+  
+  # -- assume df has: participant_ID, s (0..1), feedback_type, directed_motion, slider_response1_2.response --
+  
+  df <- df %>%
+    mutate(
+      participant = factor(participant_ID),
+      s = as.numeric(s),
+      r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      conf = pmin(pmax(abs(r1)/100, 0), 1),
+      Advice = factor(ifelse(tolower(feedback_type)=="over","Overestimate","Underestimate"),
+                      levels=c("Underestimate","Overestimate")),
+      Directed_Motion = factor(ifelse(grepl("present|\\bdp\\b", tolower(directed_motion)),
+                                      "Present","Absent"),
+                               levels=c("Present","Absent"))
+    ) %>%
+    filter(is.finite(s), is.finite(conf), !is.na(Advice), !is.na(Directed_Motion)) %>%
+    group_by(participant) %>%
+    mutate(
+      conf_b = mean(conf, na.rm = TRUE),      # between-person mean
+      conf_w = conf - conf_b                  # within-person trial deviation
+    ) %>% ungroup() %>%
+    mutate(conf_b_c = conf_b - mean(conf_b, na.rm = TRUE))
+  
+  # Smithson–Verkuilen squeeze for DV only
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+  
+  options(contrasts = c("contr.sum","contr.poly"))
+  
+  # Base (no confidence): already established earlier, but here is the "with-confidence, no moderation"
+  m_ADC <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  summary(m_ADC)
+  
+  
+  # Add the moderation term: Advice × conf_w  (trial-level moderation)
+  m_ADCint <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + Advice:conf_w + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  summary(m_ADCint)
+  anova(m_ADC, m_ADCint, test = "Chisq")   # <- LRT for moderation by (within) confidence
+  
+  # Comparison: 
+  
+  # --- DV squeeze (same for both models) ---
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+  
+  # --- Model without confidence (experimental factors only) ---
+  m_AD <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + (1 | participant),
+    family = beta_family("logit"),
+    data = df
+  )
+  
+  # --- Model with confidence (adds within + between) ---
+  m_ADC <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"),
+    data = df
+  )
+  
+  # --- Likelihood-ratio test & ICs ---
+  anova(m_AD, m_ADC, test = "Chisq")        # does confidence improve fit?
+  compare_performance(m_AD, m_ADC, rank=TRUE)
+  r2_AD  <- performance::r2(m_AD)
+  r2_ADC <- performance::r2(m_ADC)
+  r2_AD; r2_ADC
+  
+  # --- (Nice to report) effect of conf_w on the response scale ---
+  library(emmeans)
+  # choose +/- 1 SD of conf_w for illustration
+  sdw <- sd(df$conf_w, na.rm = TRUE)
+  
+  # average over Directed_Motion proportionally; set conf_b_c=0 (mean person)
+  emm_conf <- emmeans(
+    m_ADC, ~ conf_w,
+    at = list(conf_w = c(-sdw, +sdw), conf_b_c = 0),
+    type = "response", weights = "proportional"
+  )
+  emm_conf
+  
+  # Comparison: 
+  
+  # Main-effects-of-confidence model (no moderation)
+  m_ADC <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # Allow confidence to moderate Advice × Directed (adds conf_w:Advice, conf_w:Directed, conf_w:Advice:Directed)
+  m_ADCx <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion * conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # Likelihood-ratio test: does adding the moderation terms help?
+  anova(m_ADC, m_ADCx, test = "Chisq")
+  
+  ---
+    # Adding Binary
+    
+    infile <- file.path(output_dir, "siu_trials_clean.csv")
+  dat <- readr::read_csv(infile, show_col_types = FALSE)
+  
+  df <- dat %>%
+    mutate(
+      participant = factor(participant_ID),
+      s    = as.numeric(s),
+      r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      conf = pmin(pmax(abs(r1)/100, 0), 1),
+      
+      Advice = factor(dplyr::case_when(
+        tolower(feedback_type) == "over"  ~ "Over",
+        tolower(feedback_type) == "under" ~ "Under",
+        TRUE ~ NA_character_
+      ), levels = c("Under","Over")),
+      
+      Directed_Motion = factor(dplyr::case_when(
+        grepl("present|\\bdp\\b", tolower(directed_motion)) ~ "Present",
+        grepl("absent|\\bda\\b",  tolower(directed_motion)) ~ "Absent",
+        TRUE ~ NA_character_
+      ), levels = c("Present","Absent")),
+      
+      # Binary R1 (exclude exact 0 as undecided)
+      chase_bin = dplyr::case_when(
+        r1 > 0  ~ "Yes",
+        r1 < 0  ~ "No",
+        TRUE    ~ NA_character_
+      )
+    ) %>%
+    filter(is.finite(s), !is.na(Advice), !is.na(Directed_Motion), !is.na(chase_bin)) %>%
+    mutate(
+      chase_bin = factor(chase_bin, levels = c("No","Yes"))
+    ) %>%
+    # within/between confidence
+    group_by(participant) %>%
+    mutate(
+      conf_b = mean(conf, na.rm = TRUE),
+      conf_w = conf - conf_b
+    ) %>% ungroup() %>%
+    mutate(conf_b_c = conf_b - mean(conf_b, na.rm = TRUE))
+  
+  # Smithson–Verkuilen squeeze for DV (keeps 0/1)
+  N <- nrow(df)
+  df <- df %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+  
+  options(contrasts = c("contr.sum","contr.poly"))
+  
+  # --- Model ladder ---
+  # 1) Your current best model
+  m_ADC <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # 2) Add binary decision as a main effect
+  m_ADCB <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + chase_bin + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # 3) Does Yes/No modulate the Over vs Under difference? (Advice × chase_bin)
+  m_ADCBxA <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + chase_bin + Advice:chase_bin +
+      conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # 4) (Optional) Full three-way with Directed (only if you have power / interest)
+  m_ADCBxAD <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + chase_bin +
+      Advice:chase_bin + Directed_Motion:chase_bin +
+      Advice:Directed_Motion:chase_bin +
+      conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # --- Nested comparisons ---
+  anova(m_ADC, m_ADCB,   test="Chisq")  # does Yes/No add beyond Advice×Directed + confidence?
+  anova(m_ADCB, m_ADCBxA, test="Chisq") # does Advice×Yes/No improve fit? (moderation of asymmetry)
+  # optional:
+  # anova(m_ADCBxA, m_ADCBxAD, test="Chisq")  # three-way with Directed
+  
+  # --- If Advice×Yes/No is NOT significant, stop at m_ADCB and report main effect of Yes/No.
+  # --- If it IS significant, probe simple Advice effects within Yes and within No:
+  emm_A_by_bin <- emmeans(m_ADCBxA, ~ Advice | chase_bin, type = "response")
+  contrast(emm_A_by_bin, "pairwise")  # Over vs Under within No; within Yes
+  
+  # --- Also nice: Over–Under difference changes between No and Yes?
+  emtr_conf <- emtrends(m_ADCBxA, ~ chase_bin, var = "I(Advice=='Over')")
+  # or equivalently compare the Over–Under contrasts across chase_bin:
+  ovund <- contrast(emm_A_by_bin, "revpairwise")  # (Over - Under) within each chase_bin
+  pairs(ovund)  # difference of Over-Under between Yes and No
+  
+  # Base (what you called m_ADC)
+  m_ADC <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # Add Yes/No main effect + Advice×Yes/No interaction
+  m_ADCBxA <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + chase_bin + Advice:chase_bin +
+      conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  anova(m_ADC, m_ADCBxA, test="Chisq")  # overall improvement from adding Yes/No terms
+  
+  
+  # Best (hierarchical) model
+  m_best <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + Advice * chase_bin + conf_w + conf_b_c + (1 | participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  summary (m_best)
+  
+  # Comparison
+  
+  # Current "best" with both interactions
+  m_both <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion + Advice * chase_bin + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # Drop Advice:Directed but keep Directed main (hierarchical step)
+  m_noAxD <- glmmTMB(
+    s_sv ~ Advice + Directed_Motion + Advice * chase_bin + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  # Drop Directed entirely (if the previous step is n.s.)
+  m_noDir <- glmmTMB(
+    s_sv ~ Advice * chase_bin + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  anova(m_both, m_noAxD,  test="Chisq")  # does Advice×Directed add anything? 
+  anova(m_noAxD, m_noDir, test="Chisq")  # does Directed main effect add anything?
+  
+  
+  # BEST MODEL: 
+  
+  Best<- glmmTMB(
+    s_sv ~ Advice * chase_bin + conf_w + conf_b_c + (1|participant),
+    family = beta_family("logit"), data = df
+  )
+  
+  summary (Best)
+  
+  # Mediation: 
+  
+  m_a_conf <- glmmTMB(
+    conf_sv ~ Synchrony * Directed_Motion + (1 | participant),
+    family = beta_family("logit"), data = df_R1  # df_R1: one row per trial before advice
+  )
+  
+)
