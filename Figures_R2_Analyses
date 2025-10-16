@@ -1,0 +1,1675 @@
+# Columns: 
+# participant_ID
+# condition: HSDP, MSDP, LSDP, HSDA, MSDA, LSDA
+# synchrony: high (HS), medium (MS), low (LS)
+# directed_motion: present (DP), absent (DA)
+# feedback_type: over, under, random (will not be analysed)
+# slider_response1_2.response: first response on a slider -100 to +100
+# slider_response1_2.rt: RT of first response 
+# agent_feedback: + 25, -25 or random based on the participant's response
+# slider_response2_2.response: second response on a slider -100 to +100
+# slider_response2_2.rt: RT of second response
+
+# ------------------------------------------------------------------------------
+# Load Required Libraries
+# ------------------------------------------------------------------------------
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggrepel)
+library(lme4) 
+library(glmmTMB)     
+library(emmeans)     
+library(performance) 
+library(tibble)
+
+# ------------------------------------------------------------------------------
+# Set Working Directory and Clear Workspace
+# ------------------------------------------------------------------------------
+
+# Clear the workspace
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2025/PhD/Paper3_Social_Influence/R_Code")
+
+input_dir  <- "DISCS_csv"   # relative to your working dir
+output_dir <- "Output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots Preparations: Version 1
+# ------------------------------------------------------------------------------
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1
+#    i.e., drop big opposite (s < 0) and big overshoot (s > 1).
+# 5) Keep all advice-gap magnitudes |X − R1| (including < 25 units); 
+# no gap-based exclusions.
+
+
+
+eps  <- 1e-8     # numerical safety for division
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots Line Plot: Version 1
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Robust recodes 
+rec_sync <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  case_when(
+    str_detect(x, "high|\\bhs\\b|^h\\b")   ~ "High",
+    str_detect(x, "medium|\\bms\\b|^m\\b") ~ "Medium",
+    str_detect(x, "low|\\bls\\b|^l\\b")    ~ "Low",
+    TRUE ~ NA_character_
+  )
+}
+rec_dir <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  case_when(
+    str_detect(x, "present|\\bdp\\b") ~ "Present",
+    str_detect(x, "absent|\\bda\\b")  ~ "Absent",
+    TRUE ~ NA_character_
+  )
+}
+
+# Ensure s exists 
+tiny <- 2
+eps  <- 1e-8
+
+needs_s <- !("s" %in% names(dat))
+if (needs_s) {
+  # Compute s with your rules directly from the cleaned CSV
+  dat <- dat %>%
+    mutate(
+      R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+      X  = suppressWarnings(as.numeric(agent_feedback))
+    )
+  
+  prep <- dat %>%
+    mutate(
+      denom     = X - R1,
+      num       = R2 - R1,
+      equal_RX  = (R1 == X),
+      toward    = sign(denom) * num >= 0,
+      away      = sign(denom) * num <  0,
+      overshoot = sign(denom) * (R2 - X) > 0,
+      move_mag        = abs(num),
+      overshoot_mag   = abs(R2 - X),
+      small_overall   = move_mag <= tiny,
+      small_opposite  = away & (move_mag <= tiny),
+      small_overshoot = overshoot & (overshoot_mag <= tiny)
+    ) %>%
+    filter(!equal_RX) %>%
+    mutate(
+      R2_adj = case_when(
+        small_overshoot                 ~ X,
+        small_overall | small_opposite  ~ R1,
+        TRUE                            ~ R2
+      ),
+      s = (R2_adj - R1) / pmax(abs(denom), eps) * sign(denom)
+    ) %>%
+    filter(is.finite(s), s >= 0, s <= 1)
+  
+  # Bind s (and R2_adj) back into dat using row order (cleaned CSV should be aligned;
+  # if not, you can key-join by your trial identifier).
+  dat <- prep
+}
+
+# Build plotting dataset 
+s_df <- dat %>%
+  transmute(
+    participant = factor(participant_ID),
+    Directed_Motion = factor(rec_dir(directed_motion), levels = c("Present","Absent")),
+    Synchrony       = factor(rec_sync(synchrony),       levels = c("High","Medium","Low")),
+    s = as.numeric(s)
+  ) %>%
+  filter(is.finite(s))
+
+stopifnot(nrow(s_df) > 0)
+
+# Condition means & CIs across Ps 
+final_results_s <- s_df %>%
+  group_by(participant, Directed_Motion, Synchrony) %>%
+  summarise(s_mean = mean(s, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Directed_Motion, Synchrony) %>%
+  summarise(
+    Mean_s = mean(s_mean, na.rm = TRUE),
+    n      = n(),
+    SE     = sd(s_mean, na.rm = TRUE) / sqrt(n),
+    tcrit  = qt(0.975, df = n - 1),
+    Lower_Bound = Mean_s - tcrit * SE,
+    Upper_Bound = Mean_s + tcrit * SE,
+    .groups = "drop"
+  )
+
+participant_means <- s_df %>%
+  group_by(participant, Directed_Motion, Synchrony) %>%
+  summarise(s_mean = mean(s, na.rm = TRUE), .groups = "drop")
+
+# Styling & Plot 
+sync_cols <- c("High"="orange","Medium"="grey60","Low"="darkgreen")
+
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.justification = "center",
+    legend.box.just = "center",
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 13),
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+set.seed(123)
+
+p_interaction_s <- ggplot() +
+  geom_point(
+    data = participant_means,
+    aes(x = Directed_Motion, y = s_mean, color = Synchrony),
+    position = position_jitter(width = 0.02, height = 0),
+    alpha = 0.27, size = 1.5, stroke = 0, show.legend = FALSE
+  ) +
+  geom_line(
+    data = final_results_s,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony, group = Synchrony),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = final_results_s,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony),
+    size = 3
+  ) +
+  geom_errorbar(
+    data = final_results_s,
+    aes(x = Directed_Motion, ymin = Lower_Bound, ymax = Upper_Bound, color = Synchrony),
+    width = 0.10, linewidth = 0.5
+  ) +
+  scale_color_manual(values = sync_cols, breaks = c("High","Medium","Low"), name = "Synchrony") +
+  scale_x_discrete(limits = c("Present","Absent")) +
+  scale_y_continuous(limits = c(0,1), breaks = c(0, .25, .5, .75, 1)) +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey60") +
+  labs(x = "Directed Motion", y = "Social Information Use, s (0–1)") +
+  theme_consistent +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+print(p_interaction_s)
+
+ggsave(file.path(output_dir, "s_interaction_adjusted_rules_faded_dots.png"),
+       plot = p_interaction_s, dpi = 300, width = 7, height = 5, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Save Number of Exclusions per Condition
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+dat_si <- dat %>%
+  mutate(feedback_type_clean = tolower(trimws(as.character(feedback_type)))) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random")
+
+# Settings 
+tiny <- if (exists("tiny")) tiny else 2   # ≤2 units threshold
+eps  <- 1e-8
+
+# Build base with numerics & conditions (no exclusions yet) 
+base <- dat_si %>%
+  mutate(
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present","Present","Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))
+  )
+
+# Flag exact X==R1 (exclusion reason 1) ---
+base <- base %>%
+  mutate(equal_RX = R1 == X)
+
+# Counts before applying equal-RX drop
+totals <- base %>%
+  count(Synchrony, Directed_Motion, name = "n_total_after_random")
+
+excl_equal <- base %>%
+  filter(equal_RX) %>%
+  count(Synchrony, Directed_Motion, name = "excl_equalRX")
+
+# Apply small-move adjustments on the remaining trials 
+prep <- base %>%
+  filter(!equal_RX) %>%                               # drop exact-equals now
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    small_overall   = move_mag <= tiny,             # rule 4
+    small_opposite  = away & (move_mag <= tiny),    # rule 3
+    small_overshoot = overshoot & (overshoot_mag <= tiny)  # rule 2
+  ) %>%
+  mutate(
+    R2_adj = dplyr::case_when(
+      small_overshoot                 ~ X,   # tiny overshoot -> clamp to X
+      small_overall | small_opposite  ~ R1,  # tiny move/opposite -> clamp to R1
+      TRUE                            ~ R2
+    ),
+    s = (R2_adj - R1) / pmax(abs(denom), eps) * sign(denom)
+  )
+
+# Post-adjustment exclusions (reasons 2 & 3) ---
+excl_opposite <- prep %>%
+  filter(s < 0) %>%
+  count(Synchrony, Directed_Motion, name = "excl_opposite_big")
+
+excl_overshoot <- prep %>%
+  filter(s > 1) %>%
+  count(Synchrony, Directed_Motion, name = "excl_overshoot_big")
+
+# Kept trials (0 <= s <= 1) 
+kept <- prep %>%
+  filter(s >= 0, s <= 1) %>%
+  count(Synchrony, Directed_Motion, name = "n_kept_final")
+
+# Assemble per-condition table 
+summary_by_condition <- totals %>%
+  left_join(excl_equal,     by = c("Synchrony","Directed_Motion")) %>%
+  left_join(excl_opposite,  by = c("Synchrony","Directed_Motion")) %>%
+  left_join(excl_overshoot, by = c("Synchrony","Directed_Motion")) %>%
+  left_join(kept,           by = c("Synchrony","Directed_Motion")) %>%
+  mutate(across(c(excl_equalRX, excl_opposite_big, excl_overshoot_big, n_kept_final),
+                ~ dplyr::coalesce(.x, 0L))) %>%
+  arrange(Synchrony, Directed_Motion) %>%
+  mutate(
+    check_total = excl_equalRX + excl_opposite_big + excl_overshoot_big + n_kept_final,
+    # optional percentages (of the post-random total)
+    pct_equalRX     = excl_equalRX     / n_total_after_random,
+    pct_oppositeBig = excl_opposite_big/ n_total_after_random,
+    pct_overshootBig= excl_overshoot_big/ n_total_after_random,
+    pct_kept        = n_kept_final     / n_total_after_random
+  )
+
+cat("\nExclusions and kept trials per condition (after removing 'random'):\n")
+print(summary_by_condition)
+write_csv(summary_by_condition, file.path(output_dir, "exclusion_counts_by_condition_adjusted_rules.csv"))
+
+# ------------------------------------------------------------------------------
+# Histogram Distribution of X (social feedback)
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Recode helpers 
+rec_sync <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    str_detect(x, "high|\\bhs\\b|^h\\b")   ~ "High",
+    str_detect(x, "medium|\\bms\\b|^m\\b") ~ "Medium",
+    str_detect(x, "low|\\bls\\b|^l\\b")    ~ "Low",
+    TRUE ~ NA_character_
+  )
+}
+rec_dir <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    str_detect(x, "present|\\bdp\\b") ~ "Present",
+    str_detect(x, "absent|\\bda\\b")  ~ "Absent",
+    TRUE ~ NA_character_
+  )
+}
+
+# Build |X - R1| 
+df_gap30 <- dat %>%
+  mutate(
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    abs_gap = abs(X - R1),
+    Synchrony       = factor(rec_sync(synchrony),       levels = c("High","Medium","Low")),
+    Directed_Motion = factor(rec_dir(directed_motion),  levels = c("Present","Absent"))
+  ) %>%
+  filter(is.finite(R1), is.finite(X), !is.na(Synchrony), !is.na(Directed_Motion)) %>%
+  filter(abs_gap > 0, abs_gap <= 30)  # truncate at 30
+
+# Per-condition stats 
+gap_stats30 <- df_gap30 %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(
+    n_trials   = n(),
+    mean_gap   = mean(abs_gap),
+    median_gap = median(abs_gap),
+    sd_gap     = sd(abs_gap),
+    .groups = "drop"
+  )
+print(gap_stats30)
+
+# Styling & plot 
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+p_gap_hist30 <- ggplot(df_gap30, aes(x = abs_gap)) +
+  geom_histogram(
+    binwidth = 2, boundary = 0, closed = "right",
+    color = "white", fill = "grey60"
+  ) +
+  geom_vline(
+    data = gap_stats30, aes(xintercept = median_gap),
+    linetype = 2, linewidth = 0.7, color = "grey30"
+  ) +
+  facet_grid(Synchrony ~ Directed_Motion) +
+  scale_x_continuous(limits = c(0, 30), breaks = seq(0, 30, 5)) +
+  labs(
+    x = "Advice Gap |X − R1| (slider units)",
+    y = "Trial Count"
+  ) +
+  theme_consistent
+
+print(p_gap_hist30)
+
+ggsave(file.path(output_dir, "hist_abs_gap_by_condition_truncated30.png"),
+       plot = p_gap_hist30, dpi = 300, width = 9, height = 7, units = "in", bg = "white")
+
+
+# ------------------------------------------------------------------------------
+# Histogram Distribution of s (social feedback)
+# ------------------------------------------------------------------------------
+
+# Rules applied: 
+# 1) Exclude trials with feedback_type == "random"
+# 2) Drop trials where R1 == X (denominator would be zero). 
+# 3) Compute s = (R2_adj − R1) / (X − R1), then keep  0 ≤ s ≤ 1 # i.e., 
+# but also 'big' opposite (s < 0) and 'big' overshoot (s > 1). 
+# 4) Keep all advice-gap magnitudes |X − R1| (including < 25 units); no gap-based exclusions.
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build s (keep opposites & overshoots; drop random & R1==X)
+df_s <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback))
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  filter(R1 != X) %>%
+  mutate(s = (R2 - R1) / (X - R1)) %>%
+  filter(is.finite(s))
+
+# Zero bar settings 
+zero_halfwidth <- 0.025     # zero bar spans [-0.025, 0.025]  
+bin_width      <- 0.05      # other bars stay at width 0.05
+
+# Count exact zeros (only exact s == 0 go into the zero bar)
+n_zero <- sum(df_s$s == 0, na.rm = TRUE)
+zero_rect <- tibble(
+  xmin = -zero_halfwidth,
+  xmax =  zero_halfwidth,
+  ymin = 0,
+  ymax = n_zero,
+  where = "zero"
+)
+
+# Build custom breaks so adjacent bars start at ±zero_halfwidth and continue in 0.05 steps
+min_s <- min(df_s$s, na.rm = TRUE)
+max_s <- max(df_s$s, na.rm = TRUE)
+
+start_edge <- floor((min_s - zero_halfwidth) / bin_width) * bin_width + zero_halfwidth
+end_edge   <- ceiling((max_s - zero_halfwidth) / bin_width) * bin_width + zero_halfwidth
+edges <- seq(from = start_edge, to = end_edge, by = bin_width)
+
+# Remove values inside (-H, H) from the binned data (the zero bar covers exact zeros only)
+df_nonzero <- df_s %>% filter(s <= -zero_halfwidth | s > zero_halfwidth)
+
+# Bin non-zero s into (a, b] intervals using our custom edges
+df_bins <- df_nonzero %>%
+  mutate(bin = cut(s, breaks = edges, right = TRUE, include.lowest = FALSE)) %>%
+  filter(!is.na(bin)) %>%
+  count(bin, name = "count") %>%
+  mutate(
+    lower = as.numeric(sub("\\((.*),.*", "\\1", bin)),
+    upper = as.numeric(sub(".*,(.*)]", "\\1", bin)),
+    xmin  = lower,
+    xmax  = upper,
+    ymin  = 0,
+    ymax  = count,
+    where = "nonzero"
+  ) %>%
+  select(xmin, xmax, ymin, ymax, where)
+
+# Combine zero bar + binned bars
+rects <- bind_rows(df_bins, zero_rect)
+
+# For annotations / zoom
+med_s <- median(df_s$s, na.rm = TRUE)
+q01   <- quantile(df_s$s, 0.01, na.rm = TRUE)
+q99   <- quantile(df_s$s, 0.99, na.rm = TRUE)
+
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+# Plot: zero bar in orange; median in dark green; keep s=1 reference line 
+p_s_hist_custom <- ggplot() +
+  geom_rect(data = rects %>% filter(where == "nonzero"),
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey60", color = "white") +
+  geom_rect(data = rects %>% filter(where == "zero"),
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "orange", color = "white") +
+  geom_vline(xintercept = 1.0, linetype = 3, linewidth = 0.7, color = "grey60") +
+  geom_vline(xintercept = med_s, linetype = 2, linewidth = 0.9, color = "darkgreen") +
+  coord_cartesian(xlim = c(min(q01, -0.3), max(q99, 1.3))) +
+  labs(
+    x = "Social Information Use, s (can be <0 or >1)",
+    y = "Trial Count",
+  ) +
+  theme_consistent
+
+print(p_s_hist_custom)
+
+ggsave(file.path(output_dir, "hist_social_influence_custom_zero_thick.png"),
+       plot = p_s_hist_custom, dpi = 300, width = 9, height = 7, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Histogram Distribution of s (social feedback) per condition
+# ------------------------------------------------------------------------------
+
+# Rules applied: 
+# 1) Exclude trials with feedback_type == "random"
+# 2) Drop trials where R1 == X (denominator would be zero). 
+# 3) Compute s = (R2_adj − R1) / (X − R1), then keep  0 ≤ s ≤ 1 # i.e., 
+# but also 'big' opposite (s < 0) and 'big' overshoot (s > 1). 
+# 4) Keep all advice-gap magnitudes |X − R1| (including < 25 units); no gap-based exclusions.
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build s; keep opposites & overshoots; drop random & R1==X; add condition factors ---
+df_s <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = dplyr::case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  filter(R1 != X) %>%
+  mutate(s = (R2 - R1) / (X - R1),
+         Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+         Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low"))) %>%
+  filter(is.finite(s))
+
+# Settings: thicker zero bar and 0.05 bins around it 
+zero_halfwidth <- 0.025   # zero bar span [-0.025, 0.025]
+bin_width      <- 0.05
+
+# Per-condition medians (for green lines)
+med_tbl <- df_s %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(med_s = median(s, na.rm = TRUE), .groups = "drop")
+
+# Per-condition zero bars (count exact s==0 only)
+zero_rects <- df_s %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  summarise(ymax = sum(s == 0, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    xmin  = -zero_halfwidth,
+    xmax  =  zero_halfwidth,
+    ymin  = 0,
+    where = "zero"
+  )
+
+# Per-condition nonzero binned rectangles
+rects_nonzero <- df_s %>%
+  group_by(Synchrony, Directed_Motion) %>%
+  group_modify(~{
+    g <- .x
+    # custom edges for this condition
+    min_s <- min(g$s, na.rm = TRUE)
+    max_s <- max(g$s, na.rm = TRUE)
+    start_edge <- floor((min_s - zero_halfwidth) / bin_width) * bin_width + zero_halfwidth
+    end_edge   <- ceiling((max_s - zero_halfwidth) / bin_width) * bin_width + zero_halfwidth
+    edges <- seq(from = start_edge, to = end_edge, by = bin_width)
+    
+    # remove values inside (-H, H); zero is counted only in the zero bar
+    g_nonzero <- g %>% filter(s <= -zero_halfwidth | s > zero_halfwidth)
+    
+    if (length(edges) < 2) return(tibble(xmin = numeric(0), xmax = numeric(0),
+                                         ymin = numeric(0), ymax = numeric(0)))
+    g_nonzero %>%
+      mutate(bin = cut(s, breaks = edges, right = TRUE, include.lowest = FALSE)) %>%
+      filter(!is.na(bin)) %>%
+      count(bin, name = "count") %>%
+      transmute(
+        xmin = as.numeric(sub("\\((.*),.*", "\\1", bin)),
+        xmax = as.numeric(sub(".*,(.*)]", "\\1", bin)),
+        ymin = 0,
+        ymax = count
+      )
+  }) %>%
+  ungroup() %>%
+  mutate(where = "nonzero")
+
+# Combine rects
+rects_all <- bind_rows(
+  rects_nonzero %>% mutate(fill_col = "grey60"),
+  zero_rects      %>% mutate(fill_col = "orange")
+)
+
+# Global zoom range (1st–99th percentiles) so all facets share the same x-axis
+q01 <- quantile(df_s$s, 0.01, na.rm = TRUE)
+q99 <- quantile(df_s$s, 0.99, na.rm = TRUE)
+
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    strip.background = element_blank(),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+# Faceted plot: per condition 
+p_s_hist_facets <- ggplot() +
+  geom_rect(data = rects_all,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            color = "white", fill = rects_all$fill_col) +
+  # Median line per facet (dark green)
+  geom_vline(data = med_tbl, aes(xintercept = med_s),
+             linetype = 2, linewidth = 0.9, color = "darkgreen") +
+  # Optional reference at s = 1
+  geom_vline(xintercept = 1.0, linetype = 3, linewidth = 0.7, color = "grey60") +
+  coord_cartesian(xlim = c(min(q01, -0.3), max(q99, 1.3))) +
+  labs(
+    x = "Social Information Use, s (can be <0 or >1)",
+    y = "Trial Count",
+  ) +
+  facet_grid(Synchrony ~ Directed_Motion) +
+  theme_consistent
+
+print(p_s_hist_facets)
+
+ggsave(file.path(output_dir, "hist_social_influence_custom_zero_thick_by_condition.png"),
+       plot = p_s_hist_facets, dpi = 300, width = 10, height = 8, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots Preparations: Version 2
+# ------------------------------------------------------------------------------
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1
+#    i.e., drop big opposite (s < 0) and big overshoot (s > 1).
+# 5) Keep ONLY advice-gap magnitudes |X − R1| of 25 units
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Parameters 
+tiny    <- 2      # "≤2 units" threshold for small opposite/overshoot/overall
+eps     <- 1e-8   # numeric safety
+gap_target <- 25  # focus on |X - R1| ≈ 25 units
+gap_tol    <- 2 # half-unit tolerance; set to 0 if you want exact equality only
+
+# Base: drop 'random', coerce, recode, finite 
+base <- dat %>%
+  mutate(feedback_type_clean = tolower(trimws(as.character(feedback_type)))) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  mutate(
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  mutate(
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low")),
+    abs_gap = abs(X - R1)
+  )
+
+# Focus ONLY on |X - R1| ~ 25 (with tiny tolerance) ---
+base25 <- base %>%
+  filter(abs(abs_gap - gap_target) <= gap_tol)
+
+cat("Trials with |X-R1| ~ 25 (±", gap_tol, "): ", nrow(base25), "\n", sep = "")
+
+# Apply rules (drop exact R1==X; clamp small overshoot/opposite/overall) 
+prep <- base25 %>%
+  filter(R1 != X) %>%  # exact equality dropped
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    small_overall   = move_mag <= tiny,
+    small_opposite  = away & (move_mag <= tiny),
+    small_overshoot = overshoot & (overshoot_mag <= tiny),
+    R2_adj = case_when(
+      small_overshoot                 ~ X,   # tiny overshoot -> set to X
+      small_overall | small_opposite  ~ R1,  # tiny opposite or tiny move -> set to R1
+      TRUE                            ~ R2
+    ),
+    s = (R2_adj - R1) / pmax(abs(denom), eps) * sign(denom)
+  )
+
+# Keep only valid convex-combination trials
+s_df25 <- prep %>%
+  filter(s >= 0, s <= 1, is.finite(s)) %>%
+  select(participant, Directed_Motion, Synchrony, s)
+
+stopifnot(nrow(s_df25) > 0)
+
+# ------------------------------------------------------------------------------
+# Social Influence Line Plot: Version 2
+# ------------------------------------------------------------------------------
+
+# Summaries for plots 
+final_results_s25 <- s_df25 %>%
+  group_by(Directed_Motion, Synchrony) %>%
+  summarise(
+    n = n(),
+    Mean_s = mean(s),
+    SE = sd(s) / sqrt(n),
+    Lower_Bound = Mean_s - 1.96 * SE,
+    Upper_Bound = Mean_s + 1.96 * SE,
+    .groups = "drop"
+  )
+
+participant_means_s25 <- s_df25 %>%
+  group_by(participant, Directed_Motion, Synchrony) %>%
+  summarise(p_mean = mean(s), .groups = "drop")
+
+# Styling consistent with prior figures 
+sync_cols <- c("High"="orange","Medium"="grey60","Low"="darkgreen")
+pos  <- position_dodge(width = 0.7)
+posj <- position_jitterdodge(dodge.width = 0.7, jitter.width = 0.05)
+set.seed(123)
+
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.justification = "center",
+    legend.box.just = "center",
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 13),
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+p_interaction_s25 <- ggplot() +
+  # Faded participant means (hidden from legend)
+  geom_point(
+    data = participant_means_s25,
+    aes(x = Directed_Motion, y = p_mean, color = Synchrony),
+    position = position_jitter(width = 0.02, height = 0),
+    alpha = 0.27, size = 1.5, stroke = 0, show.legend = FALSE
+  ) +
+  # Summary layers (drive the legend)
+  geom_line(
+    data = final_results_s25,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony, group = Synchrony),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = final_results_s25,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony),
+    size = 3
+  ) +
+  geom_errorbar(
+    data = final_results_s25,
+    aes(x = Directed_Motion, ymin = Lower_Bound, ymax = Upper_Bound, color = Synchrony),
+    width = 0.10, linewidth = 0.5
+  ) +
+  scale_color_manual(values = sync_cols, breaks = c("High","Medium","Low"), name = "Synchrony") +
+  scale_x_discrete(limits = c("Present","Absent")) +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,.25,.5,.75,1)) +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey60") +
+  labs(
+    x = "Directed Motion",
+    y = "Social Information Use, s (0–1)"
+  ) +
+  theme_consistent +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+print(p_interaction_s25)
+
+ggsave(file.path(output_dir, "s_interaction_gap25_only_faded_dots.png"),
+       plot = p_interaction_s25, dpi = 300, width = 7, height = 5, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots Preparations: Version 3
+# ------------------------------------------------------------------------------
+
+# Rules applied:
+# 1) Exclude trials with feedback_type == "random".
+# 2) Drop trials where R1 == X (denominator would be zero).
+# 3) Adjust R2:
+#    (i) Tiny overshoot (|R2 − X| ≤ 2)  → R2_adj = X
+#    (ii) Tiny overall move (|R2 − R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1), then keep only 0 ≤ s ≤ 1 AND overshoots (s > 1).
+#    ONLY drop big opposite (s < 0) 
+# 5) Keep all advice-gap magnitudes |X − R1| 
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build s with your nes exclusions: drop R1==X and opposite moves; keep overshoots 
+eps <- 1e-8
+
+s_df <- dat %>%
+  # 1) drop 'random'
+  mutate(feedback_type_clean = tolower(trimws(as.character(feedback_type)))) %>%
+  filter(is.na(feedback_type_clean) | feedback_type_clean != "random") %>%
+  # 2) coerce to numeric & recode conditions
+  mutate(
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = ifelse(tolower(directed_motion) == "present", "Present", "Absent"),
+    Synchrony = case_when(
+      grepl("^h", tolower(synchrony)) ~ "High",
+      grepl("^m", tolower(synchrony)) ~ "Medium",
+      grepl("^l", tolower(synchrony)) ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(X)) %>%
+  # 3) exact-equality exclusion (R1 == X); keep everything else
+  filter(R1 != X) %>%
+  mutate(
+    denom = X - R1,
+    s_raw = (R2 - R1) / pmax(abs(denom), eps) * sign(denom)  # signed ratio
+  ) %>%
+  # 4) drop opposite moves ONLY (s<0); keep overshoot (s>1)
+  filter(s_raw >= 0, is.finite(s_raw)) %>%
+  transmute(
+    participant,
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony,       levels = c("High","Medium","Low")),
+    s = s_raw
+  )
+
+stopifnot(nrow(s_df) > 0)
+
+# ------------------------------------------------------------------------------
+# Social Influence Line Plot: Version 3
+# ------------------------------------------------------------------------------
+
+# Summaries for plots 
+final_results_s <- s_df %>%
+  group_by(Directed_Motion, Synchrony) %>%
+  summarise(
+    n = n(),
+    Mean_s = mean(s),
+    SE = sd(s) / sqrt(n),
+    Lower_Bound = Mean_s - 1.96 * SE,
+    Upper_Bound = Mean_s + 1.96 * SE,
+    .groups = "drop"
+  )
+
+participant_means_s <- s_df %>%
+  group_by(participant, Directed_Motion, Synchrony) %>%
+  summarise(p_mean = mean(s), .groups = "drop")
+
+# Dynamic y-axis  
+q99 <- quantile(s_df$s, 0.99, na.rm = TRUE)
+y_top <- max(1, min(2.5, as.numeric(q99)))           
+# round up to a neat quarter
+y_top_final <- ceiling(y_top * 4) / 4
+y_breaks <- unique(sort(c(seq(0, y_top_final, by = 0.25), 1)))  # always show 1.0 line
+
+# Aesthetics (match earlier figures)
+sync_cols <- c("High"="orange","Medium"="grey60","Low"="darkgreen")
+pos  <- position_dodge(width = 0.7)
+posj <- position_jitterdodge(dodge.width = 0.7, jitter.width = 0.05)
+set.seed(123)
+
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.justification = "center",
+    legend.box.just = "center",
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 13),
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+p_interaction_s_keepOver <- ggplot() +
+  # Faded participant means (keep legend clean)
+  geom_point(
+    data = participant_means_s,
+    aes(x = Directed_Motion, y = p_mean, color = Synchrony),
+    position = position_jitter(width = 0.02, height = 0),
+    alpha = 0.27, size = 1.5, stroke = 0, show.legend = FALSE
+  ) +
+  # Summary layers (drive the legend)
+  geom_line(
+    data = final_results_s,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony, group = Synchrony),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = final_results_s,
+    aes(x = Directed_Motion, y = Mean_s, color = Synchrony),
+    size = 3
+  ) +
+  geom_errorbar(
+    data = final_results_s,
+    aes(x = Directed_Motion, ymin = Lower_Bound, ymax = Upper_Bound, color = Synchrony),
+    width = 0.10, linewidth = 0.5
+  ) +
+  scale_color_manual(values = sync_cols, breaks = c("High","Medium","Low"), name = "Synchrony") +
+  scale_x_discrete(limits = c("Present","Absent")) +
+  scale_y_continuous(limits = c(0, y_top_final), breaks = y_breaks, expand = expansion(mult = c(0, 0.02))) +
+  geom_hline(yintercept = 1, linetype = 3, color = "grey60") +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey70") +
+  labs(x = "Directed Motion", y = "Social Information Use, s (0–∞)") +
+  theme_consistent +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+print(p_interaction_s_keepOver)
+
+ggsave(file.path(output_dir, "s_interaction_keepOvershoot_faded_dots.png"),
+       plot = p_interaction_s_keepOver, dpi = 300, width = 7, height = 5, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots: Version 4
+# ------------------------------------------------------------------------------
+
+# Social-information use by Advice Direction (Over vs Under)
+
+# Rules:
+# 1) Exclude feedback_type == "random"
+# 2) Drop R1 == X
+# 3) Adjust R2:
+#    (i) tiny overshoot (|R2−X| ≤ 2)  → R2_adj = X
+#    (ii) tiny overall move (|R2−R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1); keep only 0 ≤ s ≤ 1
+# 5) Keep all |X − R1| magnitudes (no gap-based exclusions)
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build plotting data
+s_df <- dat %>%
+  mutate(
+    # derive advice direction from the original feedback_type
+    Advice_Direction = case_when(
+      str_detect(tolower(trimws(as.character(feedback_type))), "^over")  ~ "Overestimator",
+      str_detect(tolower(trimws(as.character(feedback_type))), "^under") ~ "Underestimator",
+      TRUE ~ NA_character_
+    ),
+    participant = factor(participant_ID),
+    s = as.numeric(s)   # use the s already in the cleaned file
+  ) %>%
+  # keep only over/under trials with valid s
+  filter(!is.na(Advice_Direction), is.finite(s)) %>%
+  mutate(Advice_Direction = factor(Advice_Direction, levels = c("Underestimator","Overestimator")))
+
+stopifnot(nrow(s_df) > 0)
+
+# Summaries (means ± 95% CI) 
+final_results_advice <- s_df %>%
+  group_by(Advice_Direction, participant) %>%
+  summarise(s_mean = mean(s, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Advice_Direction) %>%
+  summarise(
+    n          = n(),
+    Mean_s     = mean(s_mean, na.rm = TRUE),
+    SE         = sd(s_mean, na.rm = TRUE) / sqrt(n),
+    tcrit      = qt(0.975, df = n - 1),
+    Lower_Bound = Mean_s - tcrit * SE,
+    Upper_Bound = Mean_s + tcrit * SE,
+    .groups = "drop"
+  )
+print(final_results_advice)
+
+# Plot styling 
+theme_consistent <- theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+# y-limits (pad a bit around observed range)
+ymin <- min(s_df$s, na.rm = TRUE)
+ymax <- max(s_df$s, na.rm = TRUE)
+pad  <- max(0.05, 0.08 * (ymax - ymin))
+y_lo <- max(-0.3, ymin - pad)
+y_hi <- min( 1.3, ymax + pad)
+y_breaks <- seq(floor(y_lo * 4) / 4, ceiling(y_hi * 4) / 4, by = 0.25)
+
+# Line plot
+p_line_advice <- ggplot(final_results_advice, aes(x = Advice_Direction, y = Mean_s, group = 1)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower_Bound, ymax = Upper_Bound), width = 0.10, linewidth = 0.5) +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey60") +
+  scale_y_continuous(breaks = y_breaks) +
+  coord_cartesian(ylim = c(y_lo, y_hi), clip = "off") +
+  labs(x = "Advice Direction", y = "Social Information Use, s") +
+  theme_consistent
+
+print(p_line_advice)
+ggsave(file.path(output_dir, "s_line_by_advice_direction_300DPI.png"),
+       plot = p_line_advice, dpi = 300, width = 7, height = 5, units = "in", bg = "white")
+
+#  Violin plot 
+p_violin_advice <- ggplot(s_df, aes(x = Advice_Direction, y = s, fill = Advice_Direction)) +
+  geom_violin(alpha = 0.5, trim = FALSE, color = NA) +
+  stat_summary(fun = mean, geom = "point", size = 3, color = "black") +
+  stat_summary(
+    fun.data = function(z) c(y = mean(z), ymin = mean(z) - 1.96*sd(z)/sqrt(length(z)), ymax = mean(z) + 1.96*sd(z)/sqrt(length(z))),
+    geom = "errorbar", width = 0.15, linewidth = 0.5, color = "black"
+  ) +
+  scale_y_continuous(breaks = y_breaks) +
+  coord_cartesian(ylim = c(y_lo, y_hi), clip = "off") +
+  labs(x = "Advice Direction", y = "Social Information Use, s") +
+  theme_consistent + guides(fill = "none")
+
+print(p_violin_advice)
+ggsave(file.path(output_dir, "s_violin_by_advice_direction_300DPI.png"),
+       plot = p_violin_advice, dpi = 300, width = 7, height = 5, units = "in", bg = "white")
+
+# ------------------------------------------------------------------------------
+# Social Influence Plots: Version 5
+# ------------------------------------------------------------------------------
+
+# Social-information use by Advice Direction X Directed Motion 
+
+# Rules:
+# 1) Exclude feedback_type == "random"
+# 2) Drop R1 == X
+# 3) Adjust R2:
+#    (i) tiny overshoot (|R2−X| ≤ 2)  → R2_adj = X
+#    (ii) tiny overall move (|R2−R1| ≤ 2) or tiny opposite (≤ 2) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1); keep only 0 ≤ s ≤ 1
+# 5) Keep all |X − R1| magnitudes (no gap-based exclusions)
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build plotting data directly from the cleaned CSV
+s_df <- dat %>%
+  mutate(
+    # Advice direction exactly as in your original
+    Advice_Direction = case_when(
+      str_trim(tolower(as.character(feedback_type))) == "over"  ~ "Overestimate",
+      str_trim(tolower(as.character(feedback_type))) == "under" ~ "Underestimate",
+      TRUE ~ NA_character_
+    ),
+    Directed_Motion = case_when(
+      str_detect(tolower(as.character(directed_motion)), "present|\\bdp\\b") ~ "Present",
+      str_detect(tolower(as.character(directed_motion)), "absent|\\bda\\b")  ~ "Absent",
+      TRUE ~ NA_character_
+    ),
+    participant = factor(participant_ID),
+    s = as.numeric(s)
+  ) %>%
+  filter(!is.na(Advice_Direction), !is.na(Directed_Motion), is.finite(s)) %>%
+  mutate(
+    # IMPORTANT: set levels to match your color mapping
+    Advice_Direction = factor(Advice_Direction, levels = c("Overestimate","Underestimate")),
+    Directed_Motion  = factor(Directed_Motion,  levels = c("Present","Absent"))
+  )
+
+# Condition means for plotting (trial-weighted across Synchrony, like your original)
+plot_df <- s_df %>%
+  group_by(Advice_Direction, Directed_Motion) %>%
+  summarise(
+    n      = n(),
+    mean_s = mean(s),
+    SE     = sd(s)/sqrt(n),
+    lo     = mean_s - 1.96*SE,
+    hi     = mean_s + 1.96*SE,
+    .groups = "drop"
+  )
+
+# Participant means (faint dots)
+pmeans <- s_df %>%
+  group_by(participant, Advice_Direction, Directed_Motion) %>%
+  summarise(p_mean = mean(s), .groups = "drop")
+
+# Exact colors
+adv_cols <- c("Overestimate" = "#D55E00",
+              "Underestimate" = "#0072B2")
+
+# Plot (same scaling so nothing gets clipped)
+p <- ggplot(plot_df, aes(x = Directed_Motion, y = mean_s,
+                         color = Advice_Direction, group = Advice_Direction)) +
+  geom_point(
+    data = pmeans,
+    aes(x = Directed_Motion, y = p_mean, color = Advice_Direction),
+    position = position_jitter(width = 0.05, height = 0),
+    alpha = 0.27, size = 1, inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.10, linewidth = 0.5) +
+  scale_color_manual(values = adv_cols, name = "Advice Direction") +
+  scale_y_continuous(limits = c(-0.05, 1.05), breaks = seq(0, 1, .25)) +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey60") +
+  labs(x = "Directed Motion", y = "Social Information Use, s (0–1)") +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom")
+
+print(p)
+ggsave(file.path(output_dir, "s_lineplot_ADxDM.png"),
+       p, width = 7, height = 5, dpi = 300, bg = "white")
+
+
+# ------------------------------------------------------------------------------
+# Variable Distributions
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Minimal recodes from original columns 
+df <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    Advice = case_when(
+      str_trim(tolower(as.character(feedback_type))) == "over"  ~ "Overestimate",
+      str_trim(tolower(as.character(feedback_type))) == "under" ~ "Underestimate",
+      TRUE ~ NA_character_
+    ),
+    Directed_Motion = case_when(
+      str_detect(tolower(as.character(directed_motion)), "present|\\bdp\\b") ~ "Present",
+      str_detect(tolower(as.character(directed_motion)), "absent|\\bda\\b")  ~ "Absent",
+      TRUE ~ NA_character_
+    ),
+    Synchrony = case_when(
+      str_detect(tolower(as.character(synchrony)), "high|\\bhs\\b|^h\\b")   ~ "High",
+      str_detect(tolower(as.character(synchrony)), "medium|\\bms\\b|^m\\b") ~ "Medium",
+      str_detect(tolower(as.character(synchrony)), "low|\\bls\\b|^l\\b")    ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    s  = as.numeric(s)
+  ) %>%
+  filter(!is.na(Advice), !is.na(Directed_Motion), !is.na(Synchrony),
+         is.finite(R1), is.finite(R2), is.finite(X), is.finite(s)) %>%
+  mutate(
+    Advice = factor(Advice, levels = c("Underestimate","Overestimate")),
+    Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+    Synchrony = factor(Synchrony, levels = c("High","Medium","Low")),
+    conf = pmin(pmax(abs(R1)/100, 0), 1),
+    chase_bin = as.integer(R1 > 0),
+    abs_gap = abs(X - R1),
+    dR = R2 - R1
+  )
+
+# 1) SIU distribution & zero/one shares 
+p0 <- mean(df$s == 0); p1 <- mean(df$s == 1)
+cat(sprintf("SIU zeros: %.1f%%, ones: %.1f%%\n", 100*p0, 100*p1))
+
+g_s_hist <- ggplot(df, aes(s)) +
+  geom_histogram(binwidth=.05, boundary=0, closed="right", color="white", fill="grey60") +
+  facet_grid(Advice ~ Directed_Motion) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0,1,.25)) +
+  labs(x="Social Information Use, s (0–1)", y="Trial count",
+       title="Distribution of SIU by Advice × Directed Motion")
+
+# 2) Confidence distribution 
+pc1 <- mean(df$conf == 1); pc0 <- mean(df$conf == 0)
+cat(sprintf("Confidence at 1: %.1f%%, at 0: %.1f%%\n", 100*pc1, 100*pc0))
+
+g_conf_hist <- ggplot(df, aes(conf)) +
+  geom_histogram(binwidth=.05, boundary=0, closed="right", color="white", fill="grey60") +
+  facet_grid(Synchrony ~ Directed_Motion) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0,1,.25)) +
+  labs(x="Confidence (|R1|/100)", y="Trial count",
+       title="Confidence distribution by Synchrony × Directed Motion")
+
+
+# 4) ΔR distribution 
+g_dR <- ggplot(df, aes(dR)) +
+  geom_histogram(binwidth=5, color="white", fill="grey60") +
+  facet_grid(Advice ~ Directed_Motion) +
+  labs(x="Raw change ΔR = R2 - R1 (slider units)", y="Trial count",
+       title="Raw adjustment amount by Advice × Directed")
+
+# 5) Counts / balance tables
+tab_cells <- df %>% count(Advice, Directed_Motion, Synchrony, name="n")
+tab_part  <- df %>% count(participant, Advice, Directed_Motion, name="n")
+
+print(tab_cells)
+cat("Median trials per (Advice×Directed) within participant:\n")
+print(tab_part %>% group_by(Advice, Directed_Motion) %>%
+        summarise(median_n=median(n), min_n=min(n), max_n=max(n), .groups="drop"))
+
+# Show/Save plots
+print(g_s_hist); print(g_conf_hist); print(g_dR)
+ggsave(file.path(output_dir, "diag_SIU_hist_by_Advice_Directed.png"), g_s_hist,  width=9, height=7, dpi=300, bg="white")
+ggsave(file.path(output_dir, "diag_conf_hist_by_Syn_Directed.png"), g_conf_hist, width=9, height=7, dpi=300, bg="white")
+ggsave(file.path(output_dir, "diag_deltaR_hist_by_Advice_Directed.png"), g_dR,  width=9, height=7, dpi=300, bg="white")
+
+# ------------------------------------------------------------------------------
+# Analysis 1: Pre Social Influence Mediation Models 
+# Binary Response ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+#infile <- file.path(output_dir, "siu_trials_clean.csv")
+#dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build binary DV and factors
+df_bin <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    Directed_Motion = factor(
+      ifelse(grepl("present|\\bdp\\b", tolower(directed_motion)), "Present",
+             ifelse(grepl("absent|\\bda\\b",  tolower(directed_motion)), "Absent", NA)),
+      levels = c("Present","Absent")
+    ),
+    Synchrony = factor(dplyr::case_when(
+      grepl("high|\\bhs\\b|^h\\b",   tolower(synchrony)) ~ "High",
+      grepl("medium|\\bms\\b|^m\\b", tolower(synchrony)) ~ "Medium",
+      grepl("low|\\bls\\b|^l\\b",    tolower(synchrony)) ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    levels = c("High","Medium","Low")
+    ),
+    # Yes=1 if r1>0, No=0 if r1<0; exact zero = NA (excluded)
+    chase_bin = dplyr::case_when(
+      is.finite(r1) & r1 >  0 ~ 1L,
+      is.finite(r1) & r1 <  0 ~ 0L,
+      is.finite(r1) & r1 == 0 ~ NA_integer_,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  filter(!is.na(Directed_Motion), !is.na(Synchrony), !is.na(chase_bin))
+
+# Effect coding (sum-to-zero) on the factors 
+contrasts(df_bin$Directed_Motion) <- contr.sum(2)  # 2-level → one column (+1/-1)
+contrasts(df_bin$Synchrony)       <- contr.sum(3)  # 3-level → two columns that sum to 0
+
+# Fit mixed-effects logistic regression
+m_logit_ec <- glmer(
+  chase_bin ~ Synchrony * Directed_Motion + (1 | participant),
+  data = df_bin,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(m_logit_ec)
+
+# ------------------------------------------------------------------------------
+# Analysis 2: Pre Social Influence Mediation Models 
+# Slider ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+#infile <- file.path(output_dir, "siu_trials_clean.csv")
+#dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build analysis df
+df_r1 <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    Directed_Motion = factor(ifelse(grepl("present|\\bdp\\b", tolower(directed_motion)),
+                                    "Present",
+                                    ifelse(grepl("absent|\\bda\\b", tolower(directed_motion)), "Absent", NA)),
+                             levels = c("Present","Absent")),
+    Synchrony = factor(dplyr::case_when(
+      grepl("high|\\bhs\\b|^h\\b",   tolower(synchrony)) ~ "High",
+      grepl("medium|\\bms\\b|^m\\b", tolower(synchrony)) ~ "Medium",
+      grepl("low|\\bls\\b|^l\\b",    tolower(synchrony)) ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    levels = c("High","Medium","Low"))
+  ) %>%
+  filter(is.finite(r1), !is.na(Directed_Motion), !is.na(Synchrony))
+
+# Effect coding (sum-to-zero)
+options(contrasts = c("contr.sum","contr.poly"))
+
+# Linear mixed model on the raw slider (Gaussian)
+m_r1 <- lmer(
+  r1 ~ Synchrony * Directed_Motion + (1 | participant),
+  data = df_r1
+)
+summary(m_r1)
+
+# ------------------------------------------------------------------------------
+# Analysis 3: Pre Social Influence Mediation Models 
+# Confidence ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+#infile <- file.path(output_dir, "siu_trials_clean.csv")
+#dat <- read_csv(infile, show_col_types = FALSE)
+
+dfc <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    conf = pmin(pmax(abs(r1)/100, 0), 1),  # 0..1
+    Directed_Motion = factor(ifelse(str_detect(tolower(directed_motion), "present|\\bdp\\b"),
+                                    "Present", "Absent"),
+                             levels = c("Present","Absent")),
+    Synchrony = factor(case_when(
+      str_detect(tolower(synchrony), "high|\\bhs\\b|^h\\b")   ~ "High",
+      str_detect(tolower(synchrony), "medium|\\bms\\b|^m\\b") ~ "Medium",
+      str_detect(tolower(synchrony), "low|\\bls\\b|^l\\b")    ~ "Low",
+      TRUE ~ NA_character_
+    ), levels = c("High","Medium","Low"))
+  ) %>%
+  filter(!is.na(Directed_Motion), !is.na(Synchrony), is.finite(conf))
+
+# Smithson–Verkuilen squeeze (maps [0,1] -> (0,1) using N)
+N <- nrow(dfc)
+dfc <- dfc %>% mutate(conf_sv = (conf * (N - 1) + 0.5) / N)
+
+# Effect coding globally (optional)
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# One mixed model, all trials kept
+m_conf <- glmmTMB(
+  conf_sv ~ Synchrony * Directed_Motion + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = dfc
+)
+summary(m_conf)
+
+# ------------------------------------------------------------------------------
+# Analysis 4: Social Information Use, Model Comparison, Preparation
+# ------------------------------------------------------------------------------
+
+options(contrasts = c("contr.sum","contr.poly"))
+output_dir <- "Output"
+
+infile_siu <- file.path(output_dir, "siu_trials_clean.csv")
+dat_siu <- read_csv(infile_siu, show_col_types = FALSE)
+
+df <- dat_siu %>%
+  mutate(
+    participant = factor(participant_ID),
+    # SIU already computed in the clean file as s in [0,1]
+    s  = as.numeric(s),
+    
+    # R1-based fields (for mediators/moderators)
+    r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    conf = pmin(pmax(abs(r1) / 100, 0), 1),
+    
+    Advice = factor(case_when(
+      str_to_lower(feedback_type) == "under" ~ "Under",
+      str_to_lower(feedback_type) == "over"  ~ "Over",
+      TRUE ~ NA_character_
+    ), levels = c("Under","Over")),
+    
+    Directed_Motion = factor(if_else(
+      str_detect(str_to_lower(directed_motion), "present|\\bdp\\b"),
+      "Present", "Absent"
+    ), levels = c("Present","Absent")),
+    
+    Synchrony = factor(case_when(
+      str_detect(str_to_lower(synchrony), "high|\\bhs\\b|^h\\b")   ~ "High",
+      str_detect(str_to_lower(synchrony), "medium|\\bms\\b|^m\\b") ~ "Medium",
+      str_detect(str_to_lower(synchrony), "low|\\bls\\b|^l\\b")    ~ "Low",
+      TRUE ~ NA_character_
+    ), levels = c("High","Medium","Low")),
+    
+    # Binary decision (drops r1==0 when used)
+    chase_bin = case_when(
+      r1 > 0  ~ "Yes",
+      r1 < 0  ~ "No",
+      TRUE    ~ NA_character_
+    ),
+    chase_bin = factor(chase_bin, levels = c("No","Yes")),
+    
+    # 3-level decision (keeps r1==0)
+    chase3 = case_when(
+      r1 <  0 ~ "No",
+      r1 == 0 ~ "Undecided",
+      r1 >  0 ~ "Yes",
+      TRUE    ~ NA_character_
+    ),
+    chase3 = factor(chase3, levels = c("No","Undecided","Yes"))
+  ) %>%
+  # Keep well-formed SIU trials with Advice and Directed Motion
+  filter(is.finite(s), !is.na(Advice), !is.na(Directed_Motion))
+
+# Confidence within/between
+df <- df %>%
+  group_by(participant) %>%
+  mutate(
+    conf_b = mean(conf, na.rm = TRUE),   # between-person mean confidence
+    conf_w = conf - conf_b               # within-person deviation
+  ) %>%
+  ungroup() %>%
+  mutate(conf_b_c = conf_b - mean(conf_b, na.rm = TRUE))  # centered between
+
+# SV squeeze for beta family (map [0,1] -> (0,1))
+stopifnot(all(df$s >= 0 & df$s <= 1 & is.finite(df$s)))
+N_all <- nrow(df)
+df <- df %>% mutate(s_sv = (s * (N_all - 1) + 0.5) / N_all)
+
+fam_beta <- beta_family("logit")
+
+# ------------------------------------------------------------------------------
+# Analysis 4: Social Information Use, Model Comparison, Helpers
+# ------------------------------------------------------------------------------
+
+get_r2 <- function(m) {
+  r2 <- tryCatch(performance::r2(m), error = function(e) NULL)
+  if (is.null(r2)) return(c(R2_marg = NA_real_, R2_cond = NA_real_))
+  c(R2_marg = as.numeric(r2$R2_marginal), R2_cond = as.numeric(r2$R2_conditional))
+}
+
+summ_model <- function(fit, label) {
+  ll  <- as.numeric(logLik(fit))
+  aic <- AIC(fit); bic <- BIC(fit)
+  r2  <- get_r2(fit)
+  tibble(
+    Step = label,
+    dfModel = attr(logLik(fit), "df"),
+    logLik  = ll, AIC = aic, BIC = bic,
+    R2_marg = r2["R2_marg"], R2_cond = r2["R2_cond"]
+  )
+}
+
+vars_in_formula <- function(fml) {
+  v_fix <- all.vars(stats::terms(fml))
+  # also try to capture grouping factor names inside ( ... | group )
+  txt <- paste(deparse(fml), collapse = " ")
+  grp <- unlist(regmatches(txt, gregexpr("\\|\\s*([[:alnum:]_\\.]+)\\s*\\)", txt)))
+  grp <- gsub("^\\|\\s*|\\s*\\)$", "", grp)
+  grp <- grp[grp != ""]
+  unique(c(v_fix, grp))
+}
+
+compare_nested_refit <- function(form_prev, form_curr, data, family) {
+  # refit both models on the intersection of complete cases across the union of variables
+  vars_needed <- unique(c(vars_in_formula(form_prev), vars_in_formula(form_curr)))
+  d_sub <- data[, intersect(vars_needed, names(data)), drop = FALSE]
+  d_sub <- d_sub[stats::complete.cases(d_sub), , drop = FALSE]
+  if (nrow(d_sub) < 2) stop("Not enough rows after subsetting for comparison.")
+  
+  fit_prev <- glmmTMB(form_prev, family = family, data = d_sub)
+  fit_curr <- glmmTMB(form_curr, family = family, data = d_sub)
+  
+  aa <- anova(fit_prev, fit_curr, test = "Chisq")
+  tibble(
+    From   = paste(deparse(form_prev, width.cutoff = 500), collapse = " "),
+    To     = paste(deparse(form_curr, width.cutoff = 500), collapse = " "),
+    dChisq = aa$Chisq[2],
+    dDf    = aa$Df[2] - aa$Df[1],
+    p      = aa$`Pr(>Chisq)`[2],
+    dAIC   = AIC(fit_curr) - AIC(fit_prev)
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Analysis 4: Social Information Use, Model Comparison, Model Ladder
+# ------------------------------------------------------------------------------
+
+m0      <- glmmTMB(s_sv ~ 1 + (1|participant), family = fam_beta, data = df)
+mA      <- glmmTMB(s_sv ~ Advice + (1|participant), family = fam_beta, data = df)
+mAD     <- glmmTMB(s_sv ~ Advice + Directed_Motion + (1|participant), family = fam_beta, data = df)
+mAxD    <- glmmTMB(s_sv ~ Advice * Directed_Motion + (1|participant), family = fam_beta, data = df)
+mADC    <- glmmTMB(s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+mADC_w  <- glmmTMB(s_sv ~ Advice * Directed_Motion * conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+mSyn    <- glmmTMB(s_sv ~ Synchrony * Directed_Motion * Advice + conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+
+# Binary (decided-only, no 0 for binary response) branch
+mADCB   <- glmmTMB(s_sv ~ Advice * Directed_Motion + chase_bin + conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+mADCBxA <- glmmTMB(s_sv ~ Advice * Directed_Motion + chase_bin + Advice:chase_bin +
+                     conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+m_noAxD <- glmmTMB(s_sv ~ Advice + Directed_Motion + Advice * chase_bin +
+                     conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+m_noDir <- glmmTMB(s_sv ~ Advice * chase_bin + conf_w + conf_b_c + (1|participant),
+                   family = fam_beta, data = df)
+
+# 3-level decision (keeps 0 for binary response)
+m_AxC3   <- glmmTMB(s_sv ~ Advice * chase3 + conf_w + conf_b_c + (1 | participant),
+                    family = fam_beta, data = df)
+m_AxC3_D <- glmmTMB(s_sv ~ Advice * chase3 + Directed_Motion + conf_w + conf_b_c + (1 | participant),
+                    family = fam_beta, data = df)
+
+
+# ------------------------------------------------------------------------------
+# Analysis 4: Social Information Use, Model Comparison, Per-step summaries
+# ------------------------------------------------------------------------------
+
+# ! AICs below may reflect different Ns across branches !
+
+rows <- bind_rows(
+  summ_model(m0,         "1) Null"),
+  summ_model(mA,         "2) Advice-only"),
+  summ_model(mAD,        "3) + Directed (additive)"),
+  summ_model(mAxD,       "4) + Advice×Directed"),
+  summ_model(mADC,       "5) + Confidence (conf_w, conf_b_c)"),
+  summ_model(mADC_w,     "6) + Advice×Directed×conf_w"),
+  summ_model(mADCB,      "7) + Yes/No (main) [decided-only]"),
+  summ_model(mADCBxA,    "8) + Advice×Yes/No [decided-only]"),
+  summ_model(m_noAxD,    "9a) – Advice×Directed [decided-only]"),
+  summ_model(m_noDir,    "9b) – Directed (final candidate) [decided-only]"),
+  summ_model(mSyn,       "10) Synchrony block (vs step 5)"),
+  summ_model(m_AxC3,     "11) Advice×Decision (3-level) + confidence"),
+  summ_model(m_AxC3_D,   "12) + Directed (with 3-level decision)")
+) %>%
+  mutate(prevAIC = dplyr::lag(AIC),
+         dAIC_vs_prev = AIC - prevAIC) %>%
+  select(Step, dfModel, logLik, AIC, dAIC_vs_prev, BIC, R2_marg, R2_cond)
+
+cat("\n--- Model summaries (per step) ---\n")
+print(as.data.frame(rows), digits = 3)
+
+# ==========================
+# Planned nested comparisons (equal-N refits for each pair)
+# ==========================
+f0      <- s_sv ~ 1 + (1 | participant)
+fA      <- s_sv ~ Advice + (1 | participant)
+fAD     <- s_sv ~ Advice + Directed_Motion + (1 | participant)
+fAxD    <- s_sv ~ Advice * Directed_Motion + (1 | participant)
+fADC    <- s_sv ~ Advice * Directed_Motion + conf_w + conf_b_c + (1 | participant)
+fADC_w  <- s_sv ~ Advice * Directed_Motion * conf_w + conf_b_c + (1 | participant)
+
+# Binary branch (decided-only when compared)
+fADCB   <- s_sv ~ Advice * Directed_Motion + chase_bin + conf_w + conf_b_c + (1 | participant)
+fADCBxA <- s_sv ~ Advice * Directed_Motion + chase_bin + Advice:chase_bin + conf_w + conf_b_c + (1 | participant)
+f_noAxD <- s_sv ~ Advice + Directed_Motion + Advice * chase_bin + conf_w + conf_b_c + (1 | participant)
+f_noDir <- s_sv ~ Advice * chase_bin + conf_w + conf_b_c + (1 | participant)
+
+# 3-level decision branch (keeps zeros)
+f_AxC3   <- s_sv ~ Advice * chase3 + conf_w + conf_b_c + (1 | participant)
+f_AxC3_D <- s_sv ~ Advice * chase3 + Directed_Motion + conf_w + conf_b_c + (1 | participant)
+
+# Synchrony block
+fSyn    <- s_sv ~ Synchrony * Directed_Motion * Advice + conf_w + conf_b_c + (1 | participant)
+
+# Stepwise baseline + binary ladder (matches your earlier plan)
+cmp_rows <- bind_rows(
+  compare_nested_refit(f0,     fA,      df, fam_beta),  # Advice vs Null
+  compare_nested_refit(fA,     fAD,     df, fam_beta),  # + Directed
+  compare_nested_refit(fAD,    fAxD,    df, fam_beta),  # + Advice×Directed
+  compare_nested_refit(fAxD,   fADC,    df, fam_beta),  # + Confidence
+  compare_nested_refit(fADC,   fADC_w,  df, fam_beta),  # + Advice×conf_w (trial-level moderation)
+  compare_nested_refit(fADC,   fADCB,   df, fam_beta),  # + Yes/No main (decided-only)
+  compare_nested_refit(fADCB,  fADCBxA, df, fam_beta),  # + Advice×Yes/No (decided-only)
+  compare_nested_refit(fADCBxA,f_noAxD, df, fam_beta),  # - Advice×Directed (decided-only)
+  compare_nested_refit(f_noAxD,f_noDir, df, fam_beta),  # - Directed main (decided-only)
+  compare_nested_refit(fADC,   fSyn,    df, fam_beta)   # Synchrony block vs step 5
+)
+
+# 3-level decision branch comparisons (keeps zeros)
+cmp_rows_c3 <- bind_rows(
+  # Does Advice×Decision(3-level) improve over Advice×Directed (both include all trials)?
+  compare_nested_refit(fADC,   f_AxC3,   df, fam_beta),
+  # With chase3 in, does Directed still add anything?
+  compare_nested_refit(f_AxC3, f_AxC3_D, df, fam_beta),
+  # Optional: compare Advice×Decision(3-level) vs Advice×Yes/No (forces equal-N on decided-only)
+  compare_nested_refit(f_AxC3, fADCBxA,  df, fam_beta)
+)
+
+cmp_all <- bind_rows(cmp_rows, cmp_rows_c3)
+
+cat("\n--- Stepwise nested comparisons (equal-N refits; includes binary and 3-level branches) ---\n")
+print(as.data.frame(cmp_all), digits = 3)
+
+
+# EMMs for interpretation
+
+# Over vs Under within each R1 category for the 3-level model
+emm_c3 <- emmeans(m_AxC3, ~ Advice | chase3, type = "response")
+cat("\n--- Over vs Under within R1 categories (3-level) ---\n")
+print(contrast(emm_c3, "pairwise"))
+
+# Over vs Under within Yes/No for the binary model (decided-only)
+emm_bin <- emmeans(mADCBxA, ~ Advice | chase_bin, type = "response")
+cat("\n--- Over vs Under within Yes/No (binary) ---\n")
+print(contrast(emm_bin, "pairwise"))
+
+
+#  Save tables to CSV
+rows_out <- rows %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+cmp_out  <- cmp_all %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+write_csv(rows_out, file.path(output_dir, "model_summaries_steps.csv"))
+write_csv(cmp_out,  file.path(output_dir, "model_comparisons_equalN.csv"))
+
+
+-----
+# Colinearity 
+  
+# 1) Variance inflation (handles factors via GVIF)
+check_collinearity(m_noDir)   # or m_ADCBxA
+
+# 2) Correlation among fixed-effect estimates
+check_correlation(m_noDir)
+
+# 3) Design-matrix condition number (fixed effects only)
+ff <- formula(m_noDir)
+X  <- model.matrix(update(ff, . ~ Advice * chase_bin + conf_w + conf_b_c), data = insight::get_data(m_noDir))
+kappa_val <- kappa(X)         # < 30 is typically fine; > 100 start to worry
+kappa_val
+
+# 4) Sanity checks
+with(insight::get_data(m_noDir), cor(conf_w, conf_b_c, use = "complete.obs"))
+with(insight::get_data(m_noDir), addmargins(table(Advice, chase_bin)))
+
+D <- insight::get_data(m_noDir)  # or use your df
+
+# 1) Point-biserial correlation between Yes/No and confidence
+D$ch_bin01 <- as.numeric(D$chase_bin == "Yes")
+cor(D$ch_bin01, D$conf, use = "complete.obs")      # raw conf
+cor(D$ch_bin01, D$conf_w, use = "complete.obs")    # within-person conf (should be even smaller)
+
+# 2) Does confidence (alone) predict Yes/No strongly? (just to understand overlap)
+glm_ch <- glm(ch_bin01 ~ conf, data = D, family = binomial())
+summary(glm_ch)
+
+# 3) Condition number of the fixed-effects design used in your final SIU model
+X <- model.matrix(~ Advice * chase_bin + conf_w + conf_b_c, data = D)
+kappa(X)   # < 30 is fine; your earlier κ ≈ 8.7 was great
