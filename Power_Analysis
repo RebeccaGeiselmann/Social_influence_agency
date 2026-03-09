@@ -1,0 +1,126 @@
+# Load Required Libraries
+library(lme4)
+library(simr)
+library(tidyverse)
+
+# Load and Prepare Data
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper2_Perception_Agency/Analysis_online_experiments/3rd_online_experiment/excl_outliers")
+df <- read_csv("regression_input.csv")
+
+# Create response and condition columns safely
+df[["response"]] <- ifelse(df[["binary_question_key_resp.keys"]] == "left", 1, 0)
+df[["synchrony"]] <- ifelse(grepl("HS", df[["condition"]]), "high", "low")
+df[["direction"]] <- ifelse(grepl("DP", df[["condition"]]), "present", "absent")
+
+df[["synchrony"]] <- factor(df[["synchrony"]])
+df[["direction"]] <- factor(df[["direction"]])
+df[["participant"]] <- factor(df[["participant"]])
+
+# ✅ Set reference level to LSDA (low synchrony + direction absent)
+df$synchrony <- relevel(df$synchrony, ref = "low")
+df$direction <- relevel(df$direction, ref = "absent")
+
+# Bootstrap power
+n_sim <- 100
+sig_count <- 0
+set.seed(123)
+
+for (i in 1:n_sim) {
+  sampled_participants <- sample(unique(df[["participant"]]), size = 50)
+  df_subset <- df[df[["participant"]] %in% sampled_participants, ]
+  
+  model_sub <- tryCatch(
+    glmer(response ~ synchrony * direction + (1 | participant),
+          data = df_subset, family = binomial),
+    error = function(e) return(NULL)
+  )
+  
+  if (!is.null(model_sub)) {
+    coef_table <- summary(model_sub)$coefficients
+    if ("synchronyhigh:directionpresent" %in% rownames(coef_table)) {
+      p_val <- coef_table["synchronyhigh:directionpresent", "Pr(>|z|)"]
+      if (!is.na(p_val) && p_val < 0.05) {
+        sig_count <- sig_count + 1
+      }
+    }
+  }
+}
+
+
+observed_power <- sig_count / n_sim
+cat("Estimated power with 10 participants:", observed_power, "\n")
+
+------------
+
+# Load Required Libraries
+library(lme4)
+library(tidyverse)
+
+# Load and Prepare Data
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper2_Perception_Agency/Analysis_online_experiments/3rd_online_experiment/excl_outliers")
+df <- read_csv("regression_input.csv")
+
+# Recode variables
+df[["response"]] <- ifelse(df[["binary_question_key_resp.keys"]] == "left", 1, 0)
+df[["synchrony"]] <- ifelse(grepl("HS", df[["condition"]]), "high", "low")
+df[["direction"]] <- ifelse(grepl("DP", df[["condition"]]), "present", "absent")
+
+df[["synchrony"]] <- factor(df[["synchrony"]])
+df[["direction"]] <- factor(df[["direction"]])
+df[["participant"]] <- factor(df[["participant"]])
+
+# ✅ Effect coding (sum contrasts)
+contrasts(df$synchrony) <- contr.sum(2)
+contrasts(df$direction) <- contr.sum(2)
+
+# ✅ Define bootstrap power function
+bootstrap_power <- function(data, n_participants, nsim = 100) {
+  sig_count <- 0
+  set.seed(123)
+  
+  for (i in 1:nsim) {
+    sampled_participants <- sample(unique(data[["participant"]]), size = n_participants)
+    df_subset <- data[data[["participant"]] %in% sampled_participants, ]
+    
+    model_sub <- tryCatch(
+      glmer(response ~ synchrony * direction + (1 | participant),
+            data = df_subset, family = binomial),
+      error = function(e) return(NULL)
+    )
+    
+    if (!is.null(model_sub)) {
+      coef_table <- summary(model_sub)$coefficients
+      if ("synchrony1:direction1" %in% rownames(coef_table)) {
+        p_val <- coef_table["synchrony1:direction1", "Pr(>|z|)"]
+        if (!is.na(p_val) && p_val < 0.05) {
+          sig_count <- sig_count + 1
+        }
+      }
+    }
+  }
+  return(sig_count / nsim)
+}
+
+# ✅ Loop through different participant counts
+participant_counts <- seq(10, 78, by = 10)  # You can change step size here
+power_results <- data.frame(participants = participant_counts, power = NA)
+
+for (i in seq_along(participant_counts)) {
+  n <- participant_counts[i]
+  cat("Running power analysis for", n, "participants...\n")
+  power_results$power[i] <- bootstrap_power(df, n_participants = n, nsim = 1000)
+}
+
+# ✅ Plot power curve
+ggplot(power_results, aes(x = participants, y = power)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "red") +
+  labs(
+    title = "Bootstrap Power Curve: Interaction Effect",
+    x = "Number of Participants",
+    y = "Estimated Power"
+  ) +
+  theme_minimal()
