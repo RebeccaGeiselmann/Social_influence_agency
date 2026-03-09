@@ -1,0 +1,247 @@
+library(tidyverse)
+
+# Clear workspace
+rm(list = ls())
+
+# Set working directory (adapt to your file system)
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper2_Perception_Agency/Analysis_online_experiments/3rd_online_experiment/incl_outliers")
+
+# Load the dataset
+df <- read_csv("regression_input.csv")
+
+# Convert 'left' responses to binary (1 = "left", 0 = everything else)
+df <- df %>%
+  mutate(response = ifelse(binary_question_key_resp.keys == "left", 1, 0))
+
+# Assign each stimulus_id to its condition
+df <- df %>%
+  mutate(condition = case_when(
+    stimulus_id >= 1  & stimulus_id <= 10  ~ "HSDA",
+    stimulus_id >= 11 & stimulus_id <= 20  ~ "HSDP",
+    stimulus_id >= 21 & stimulus_id <= 30  ~ "LSDA",
+    stimulus_id >= 31 & stimulus_id <= 40  ~ "LSDP",
+    TRUE ~ NA_character_
+  ))
+
+# Stop if any stimulus is not assigned to a condition
+stopifnot(!any(is.na(df$condition)))
+
+# ----------------------------
+# GROUP CONSENSUS CALCULATION
+# ----------------------------
+
+# Compute agreement per stimulus across participants
+stimulus_agreement <- df %>%
+  group_by(condition, stimulus_id) %>%
+  summarise(
+    mean_response = mean(response),
+    agreement_prop = max(mean_response, 1 - mean_response),  # Agreement regardless of direction
+    n_participants = n(),
+    .groups = "drop"
+  )
+
+# Average agreement per condition
+condition_agreement <- stimulus_agreement %>%
+  group_by(condition) %>%
+  summarise(
+    mean_consensus = mean(agreement_prop),
+    sd_consensus = sd(agreement_prop),
+    .groups = "drop"
+  )
+
+# Print summary table
+print(condition_agreement)
+
+# Plot mean consensus with error bars
+ggplot(condition_agreement, aes(x = condition, y = mean_consensus, fill = condition)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_consensus - sd_consensus,
+                    ymax = mean_consensus + sd_consensus), width = 0.2) +
+  labs(
+    title = "Mean Inter-Participant Consensus per Condition",
+    y = "Mean Agreement Proportion",
+    x = "Condition"
+  ) +
+  theme_minimal()
+
+# ----------------------------
+# SIMULATION OF SOCIAL FEEDBACK (AGREEMENT)
+# ----------------------------
+
+# Define simulation function: 1 target participant + 5 peers
+simulate_agreement_with_target <- function(data, condition_name, n_sim = 20) {
+  data_cond <- data %>% filter(condition == condition_name)
+  
+  tibble(
+    simulation_id = 1:n_sim,
+    feedback_level = replicate(n_sim, {
+      # Select one random target participant and trial
+      target_id <- sample(unique(data_cond$participant), 1)
+      target_trial <- data_cond %>%
+        filter(participant == target_id) %>%
+        slice_sample(n = 1)
+      
+      # Select 5 peers (other participants), 1 trial each
+      peer_trials <- data_cond %>%
+        filter(participant != target_id) %>%
+        group_by(participant) %>%
+        slice_sample(n = 1) %>%
+        ungroup() %>%
+        slice_sample(n = 5)
+      
+      # Ensure correct number of samples
+      if (nrow(target_trial) != 1 || nrow(peer_trials) < 5) return(NA_character_)
+      
+      # Count number of peers who agreed with the target's response
+      n_agree <- sum(peer_trials$response == target_trial$response)
+      
+      # Return feedback level as string
+      paste0(n_agree, "/5")
+    })
+  ) %>%
+    # ❗ FIX: This was incorrectly filtering feedback_level != "0/5"
+    filter(!is.na(feedback_level) & feedback_level != "0/5") %>%
+    mutate(condition = condition_name)
+}
+
+# Run simulation for all conditions
+set.seed(123)
+conditions <- c("HSDA", "HSDP", "LSDA", "LSDP")
+
+simulated_feedback <- map_dfr(conditions, ~simulate_agreement_with_target(df, .x, n_sim = 20))
+
+# ----------------------------
+# ANALYSIS & VISUALIZATION
+# ----------------------------
+
+# Count number of trials per feedback level per condition
+feedback_counts <- simulated_feedback %>%
+  count(condition, feedback_level)
+
+# Print table
+print(feedback_counts)
+
+# Plot feedback level distribution by condition
+ggplot(feedback_counts, aes(x = feedback_level, y = n, fill = feedback_level)) +
+  geom_col() +
+  facet_wrap(~condition) +
+  labs(
+    title = "Participant-Specific Social Feedback (300 Trials per Condition)",
+    x = "Number of Peers Who Agreed with Target",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Wide-format summary table (for easier inspection)
+simulated_feedback %>%
+  count(condition, feedback_level) %>%
+  pivot_wider(names_from = feedback_level, values_from = n, values_fill = 0)
+
+# ----------------------------
+# SIMULATION: SOCIAL FEEDBACK (YES RESPONSES)
+# ----------------------------
+
+library(tidyverse)
+
+# Clear workspace
+rm(list = ls())
+
+# Set working directory
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper2_Perception_Agency/Analysis_online_experiments/3rd_online_experiment/incl_outliers")
+
+# Load the data
+df <- read_csv("regression_input.csv")
+
+# Convert 'left' responses to binary (1 = left/yes, 0 = no)
+df <- df %>%
+  mutate(response = ifelse(binary_question_key_resp.keys == "left", 1, 0))
+
+# Assign stimulus_id to condition
+df <- df %>%
+  mutate(condition = case_when(
+    stimulus_id >= 1  & stimulus_id <= 10  ~ "HSDA",
+    stimulus_id >= 11 & stimulus_id <= 20  ~ "HSDP",
+    stimulus_id >= 21 & stimulus_id <= 30  ~ "LSDA",
+    stimulus_id >= 31 & stimulus_id <= 40  ~ "LSDP",
+    TRUE ~ NA_character_
+  ))
+
+stopifnot(!any(is.na(df$condition)))
+
+simulate_feedback_proportions <- function(data, condition_name, n_sim = 100) {
+  data_cond <- data %>% filter(condition == condition_name)
+  
+  trials <- list()
+  feedback_counts <- rep(0, 6)  # indices 1 to 6 for 0/5 to 5/5
+  i <- 0
+  
+  while (length(trials) < n_sim && i < 10000) {
+    i <- i + 1
+    
+    # Sample 5 responses from different participants
+    sample_group <- data_cond %>%
+      group_by(participant) %>%
+      slice_sample(n = 1) %>%
+      ungroup() %>%
+      slice_sample(n = 5)
+    
+    if (nrow(sample_group) < 5) next
+    
+    n_yes <- sum(sample_group$response, na.rm = TRUE)
+    
+    # Safeguard: skip if n_yes is invalid
+    if (is.na(n_yes) || n_yes < 0 || n_yes > 5) next
+    
+    feedback_level <- paste0(n_yes, "/5")
+    
+    # Index for counts is (n_yes + 1) because R uses 1-based indexing
+    index <- n_yes + 1
+    
+    # Ensure all feedback levels (0 to 5) appear at least once
+    if (feedback_counts[index] == 0 || sum(feedback_counts) >= 5) {
+      trials[[length(trials) + 1]] <- tibble(
+        condition = condition_name,
+        feedback_level = feedback_level
+      )
+      feedback_counts[index] <- feedback_counts[index] + 1
+    }
+  }
+  
+  if (length(trials) < n_sim) {
+    warning(paste("Only", length(trials), "samples generated for", condition_name))
+  }
+  
+  bind_rows(trials)
+}
+
+
+# Run simulation
+set.seed(123)
+conditions <- c("HSDA", "HSDP", "LSDA", "LSDP")
+
+simulated_feedback <- map_dfr(conditions, ~simulate_feedback_proportions(df, .x, n_sim = 100))
+
+# ----------------------------
+# ANALYSIS & VISUALIZATION
+# ----------------------------
+
+# Table of feedback levels per condition
+feedback_counts <- simulated_feedback %>%
+  count(condition, feedback_level)
+
+print(feedback_counts)
+
+# Plot feedback level distribution by condition
+ggplot(feedback_counts, aes(x = feedback_level, y = n, fill = feedback_level)) +
+  geom_col() +
+  facet_wrap(~condition) +
+  labs(
+    title = "Simulated Social Feedback (100 Trials per Condition)",
+    x = "Number of Participants Saying YES",
+    y = "Trial Count"
+  ) +
+  theme_minimal()
+
+# Wide format summary
+feedback_counts %>%
+  pivot_wider(names_from = feedback_level, values_from = n, values_fill = 0)
