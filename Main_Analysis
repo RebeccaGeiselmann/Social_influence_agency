@@ -1,0 +1,948 @@
+## This script implements the quality checks and exclusions
+
+# Columns: 
+# participant_ID
+# condition: HSDP, MSDP, LSDP, HSDA, MSDA, LSDA
+# synchrony: high (HS), medium (MS), low (LS)
+# directed_motion: present (DP), absent (DA)
+# feedback_type: over, under, random (will not be analysed)
+# slider_response1_2.response: first response on a slider -100 to +100
+# slider_response1_2.rt: RT of first response 
+# agent_feedback: + 25, -25 or random based on the participant's response
+# slider_response2_2.response: second response on a slider -100 to +100
+# slider_response2_2.rt: RT of second response
+
+
+# Outliers: Participants 4, 6, 10
+# Recording errors: Participants 21,23,25
+
+# ------------------------------------------------------------------------------
+# Load Required Libraries
+# ------------------------------------------------------------------------------
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggrepel)
+library(lme4) 
+library(glmmTMB)     
+library(emmeans)     
+library(performance) 
+
+# ------------------------------------------------------------------------------
+# Set Working Directory and Clear Workspace
+# ------------------------------------------------------------------------------
+
+# Clear the workspace
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2025/PhD/Paper3_Social_Influence/R_Code")
+
+# ------------------------------------------------------------------------------
+# Define Participant Files  
+# ------------------------------------------------------------------------------
+
+input_dir  <- "DISCS_csv"   # relative to your working dir
+output_dir <- "Output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+participant_files <- sprintf("SI_P%02d.csv", 1:26)   # SI_P01.csv ... SI_P26.csv
+participant_paths <- file.path(input_dir, participant_files)
+
+# Sort numerically by P-number 
+pnum <- as.integer(sub("^SI_P(\\d+)\\.csv$", "\\1", basename(participant_paths)))
+ord  <- order(pnum)
+participant_paths <- participant_paths[ord]
+pnum <- pnum[ord]
+
+# Ensure all files exist
+missing <- participant_paths[!file.exists(participant_paths)]
+if (length(missing)) stop("Missing files:\n", paste(missing, collapse = "\n"))
+
+# ------------------------------------------------------------------------------
+# Load and Process Individual Participant Files
+# ------------------------------------------------------------------------------
+
+original_data <- list()
+max_rows <- 0
+
+for (path in participant_paths) {
+  message("Reading file: ", path)
+  data <- readr::read_csv(path, show_col_types = FALSE)
+  max_rows <- max(max_rows, nrow(data))
+  original_data[[length(original_data) + 1]] <- data
+}
+
+# ------------------------------------------------------------------------------
+# Combine Data Across Participants
+# ------------------------------------------------------------------------------
+
+# Initialize an empty data frame to store combined data for all participants, including outliers
+all_participants_incl_outliers <- data.frame()
+
+# Loop through each participant's data frame
+for (i in 1:length(original_data)) {
+  data <- original_data[[i]]
+  
+  # Ensure the data has max_rows rows, filling with NAs if not
+  if (nrow(data) < max_rows) {
+    needed <- max_rows - nrow(data)
+    na_data <- as.data.frame(matrix(NA, ncol = ncol(data), nrow = needed))
+    colnames(na_data) <- colnames(data)
+    data <- rbind(data, na_data)
+  }
+    
+  # Select the columns of interest
+  selected_data <- data[c('participant_ID', 'condition', 'synchrony', 'directed_motion', 'movie_file', 'feedback_type', 'slider_response1_2.response', 'slider_response1_2.rt', 'agent_feedback', 'slider_response2_2.response', 'slider_response2_2.rt')]
+  
+  # Rename columns to avoid name clashes
+  colnames(selected_data) <- paste0(colnames(selected_data), "_", i)
+  
+  # Append the data to the final data frame
+  if(ncol(all_participants_incl_outliers) == 0) {
+    all_participants_incl_outliers <- selected_data
+  } else {
+    all_participants_incl_outliers <- cbind(all_participants_incl_outliers, selected_data)
+  }
+}
+
+for (i in seq_along(participant_files)) {
+  col <- paste0("participant_ID_", i)
+  if (col %in% names(all_participants_incl_outliers)) {
+    all_participants_incl_outliers[[col]] <- i
+  }
+}
+
+# Save the final data frame to a CSV file
+write.csv(all_participants_incl_outliers, file.path(output_dir, "all_participants.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# Pivot to Long Format 
+# ------------------------------------------------------------------------------
+
+# Read file
+output_dir <- "Output"
+wide_table <- read_csv(file.path("Output","all_participants.csv"),
+                       show_col_types = FALSE)
+# Pivot to long
+long_table <- wide_table %>%
+  mutate(.row_id = row_number()) %>%
+  pivot_longer(
+    cols      = matches("_(\\d+)$"),
+    names_to  = c(".value", "participant"),
+    names_sep = "_(?=\\d+$)"
+  ) %>%
+  mutate(
+    participant = as.integer(participant),
+    `slider_response1_2.response` = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    `slider_response1_2.rt`       = suppressWarnings(as.numeric(`slider_response1_2.rt`)),
+    `slider_response2_2.response` = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    `slider_response2_2.rt`       = suppressWarnings(as.numeric(`slider_response2_2.rt`)),
+    condition       = toupper(as.character(condition)),
+    synchrony       = tolower(as.character(synchrony)),
+    directed_motion = tolower(as.character(directed_motion)),
+    feedback_type   = tolower(as.character(feedback_type))
+  )
+
+# Drop practice rows: first 9 original rows + row 81
+n_before <- nrow(long_table)
+long_table <- long_table %>% filter(.row_id > 8, .row_id != 81)
+cat("Removed", n_before - nrow(long_table), "rows. Remaining:", nrow(long_table), "\n")
+
+# Order by participant 
+long_table <- long_table %>% arrange(participant, .row_id)
+
+# Drop the bookkeeping column
+long_table <- long_table %>% select(-.row_id)
+
+# Save
+write_csv(long_table, file.path(output_dir, "all_participants_long.csv"))
+
+# ---------------------------------------------
+# Remove technical outliers (21, 23, 25)
+# ---------------------------------------------
+
+long_table_excl <- long_table %>%
+  filter(!participant %in% c(21, 23, 25))
+
+# Save EXCLUDING outliers
+write_csv(long_table_excl, 
+          file.path(output_dir, "all_participants_excl_technical_outliers_long.csv"))
+
+# ------------------------------------------------------------------------------
+# Quality Control Participant Level 1: Low Variance in Slider Responses (R1) 
+# ------------------------------------------------------------------------------
+
+# Flag participants whose R1 variability is unusually low
+
+# For each participant, we compute the within-person SD of their 
+# initial slider responses (R1) across all trials.
+
+# Z-score definition (participant i):
+# z_i = (SD_i  -  mean(SD across participants) ) / sd(SD across participants)
+
+# z ≈ 0   → typical variability for the group
+# z < 0   → lower-than-average variability (flatter response profile)
+# z > 0   → higher-than-average variability
+
+# We flag participants with z < -2 as "unusually flat". 
+
+output_dir <- "Output"
+
+# Read data set (already excluding technical outliers)
+long_table <- read_csv(
+  file.path(output_dir, "all_participants_excl_technical_outliers_long.csv"),
+  show_col_types = FALSE
+)
+
+# Safety checks
+if (!("participant" %in% names(long_table)))
+  stop("Column 'participant' not found in long data.")
+if (!("slider_response1_2.response" %in% names(long_table)))
+  stop("Column 'slider_response1_2.response' not found in long data.")
+
+# Make sure R1 is numeric (in case it was read as character)
+long_table <- long_table %>%
+  mutate(slider_response1_2.response = suppressWarnings(as.numeric(slider_response1_2.response)))
+
+# Compute SD and N per participant on R1
+qc_low_var <- long_table %>%
+  group_by(participant) %>%
+  summarise(
+    n_trials_used = sum(!is.na(slider_response1_2.response)),
+    sd_slider_r1  = sd(slider_response1_2.response, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Z-score across participants; flag z < -2
+qc_low_var <- qc_low_var %>%
+  mutate(
+    z_sd = as.numeric(scale(sd_slider_r1)),
+    flag_low_var = !is.na(z_sd) & z_sd < -2
+  ) %>%
+  arrange(z_sd)
+
+# Save to CSV
+qc_path <- file.path(output_dir, "qc_low_variance_slider_r1_long.csv")
+write_csv(qc_low_var, qc_path)
+cat("QC table saved to:", qc_path, "\n")
+
+# Print
+print(qc_low_var %>% select(participant, n_trials_used, sd_slider_r1, z_sd, flag_low_var))
+
+# None flagged
+
+# ------------------------------------------------------------------------------
+# Quality Control Participant Level 2: Lack of Responsiveness to Condition 
+# ------------------------------------------------------------------------------
+
+# Flag if responses show no relation to Synchrony × Directed Motion
+
+# Fits:  r1 ~ synchrony * directed_motion     
+# Flags participants with low explained variance: R^2 < r2_thresh
+
+# Read data set
+output_dir <- "Output"
+long_table <- read.csv(file.path(output_dir, "all_participants_excl_technical_outliers_long.csv"))
+
+# Tunables 
+r2_thresh <- 0.10  # "near-zero" explained variance cutoff
+min_n     <- 10    # minimal trials required to attempt a fit
+
+# Fit linear model for one participant and return R^2
+eval_participant_cont <- function(df){
+  # keep only numeric R1 rows
+  df <- df %>% filter(!is.na(`slider_response1_2.response`))
+  n  <- nrow(df)
+  
+  # ensure factors use consistent levels
+  df <- df %>%
+    mutate(
+      synchrony       = factor(tolower(synchrony), levels = c("low","medium","high")),
+      directed_motion = factor(tolower(directed_motion), levels = c("absent","present")),
+      condition       = toupper(condition)
+    )
+  
+  ok_syn <- n_distinct(df$synchrony, na.rm = TRUE)       >= 2
+  ok_dir <- n_distinct(df$directed_motion, na.rm = TRUE) >= 2
+  ok_con <- n_distinct(df$condition, na.rm = TRUE)       >= 2
+  
+  r2_cont  <- NA_real_
+  used_spec <- NA_character_
+  
+  if (n >= min_n) {
+    if (ok_syn && ok_dir) {
+      m <- try(stats::lm(`slider_response1_2.response` ~ synchrony * directed_motion, data = df), silent = TRUE)
+      if (!inherits(m, "try-error")) {
+        r2_cont  <- summary(m)$r.squared
+        used_spec <- "LM: synchrony*directed_motion"
+      }
+    } else if (ok_con) {
+      m <- try(stats::lm(`slider_response1_2.response` ~ condition, data = df), silent = TRUE)
+      if (!inherits(m, "try-error")) {
+        r2_cont  <- summary(m)$r.squared
+        used_spec <- "LM: condition (6-level)"
+      }
+    } else {
+      used_spec <- "insufficient factor variation"
+    }
+  } else {
+    used_spec <- "insufficient N"
+  }
+  
+  tibble(n = n, r2_cont = r2_cont, spec = used_spec)
+}
+
+# Run per-participant and flag
+qc_resp <- long_table %>%
+  group_by(participant) %>%
+  group_modify(~ eval_participant_cont(.x)) %>%
+  ungroup() %>%
+  mutate(
+    flag_unresponsive = case_when(
+      is.finite(r2_cont) ~ (r2_cont < r2_thresh), 
+      TRUE               ~ TRUE                    
+    )
+  )
+
+# Save to CSV 
+out_qc2 <- file.path(output_dir, "qc_lack_of_responsiveness_slider_r1.csv")
+utils::write.csv(qc_resp %>% arrange(r2_cont), out_qc2, row.names = FALSE)
+cat("QC #2 (continuous-only) table saved to:", out_qc2, "\n")
+
+# Print
+print(
+  qc_resp %>%
+    arrange(r2_cont) %>%
+    select(participant, n, r2_cont, flag_unresponsive, spec)
+)
+
+# None flagged
+
+# ------------------------------------------------------------------------------
+# Quality Control Participant Level 3: Low Variance in Response Times 
+# ------------------------------------------------------------------------------
+
+# Flag participants whose RT1 variability is unusually low
+# Near-identical RTs across trials suggest stereotyped clicking rather
+# than stimulus-driven decisions.
+
+# Primary: z-score of within-person SD(RT1) across participants (flag z < -2)
+# Robust:  MAD-z (median-based) on SD(RT1), flag z_mad < -2.5 (optional cross-check)
+
+# Read data set
+output_dir <- "Output"
+long_table <- read.csv(file.path(output_dir, "all_participants_excl_technical_outliers_long.csv"))
+  
+# Compute SD of RT1 per participant and z-score it 
+qc_rt <- long_table %>%
+  summarise(
+    n_rt1  = sum(!is.na(`slider_response1_2.rt`)),
+    sd_rt1 = sd(`slider_response1_2.rt`, na.rm = TRUE),
+    .by = participant
+  ) %>%
+  mutate(
+    z_sd_rt         = as.numeric(scale(sd_rt1)),          
+    flag_low_rtvar  = !is.na(z_sd_rt) & z_sd_rt < -2      
+  )
+
+# Robust outlier check using MAD-z on SD(RT1) 
+# This is handy if the SD distribution is skewed
+m_sd   <- median(qc_rt$sd_rt1, na.rm = TRUE)
+mad_sd <- mad(qc_rt$sd_rt1, constant = 1, na.rm = TRUE)   
+scale_mad <- if (is.finite(mad_sd) && mad_sd > 0) 1.4826 * mad_sd else NA_real_
+
+qc_rt <- qc_rt %>%
+  mutate(
+    z_mad_rt        = (sd_rt1 - m_sd) / scale_mad,
+    flag_low_rtvar_mad = ifelse(is.finite(z_mad_rt), z_mad_rt < -2.5, FALSE) # stricter robust flag
+  )
+
+# Save to CSV
+out_rt_qc <- file.path(output_dir, "qc_low_variance_rt.csv")
+write_csv(qc_rt %>% arrange(z_sd_rt), out_rt_qc)
+cat("QC #3 table saved to:", out_rt_qc, "\n")
+
+# Print
+print(qc_rt %>% arrange(z_sd_rt) %>%
+        select(participant, n_rt1, sd_rt1, z_sd_rt, flag_low_rtvar, z_mad_rt, flag_low_rtvar_mad))
+
+# None flagged 
+
+# ------------------------------------------------------------------------------
+# Exclude flagged participants
+# ------------------------------------------------------------------------------
+
+# Keep full dataset (no filtering)
+long_excl <- long_table
+
+# Save to CSV
+out_path <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+write_csv(long_excl, out_path)
+
+# Print
+cat("Saved:", out_path, "\n",
+    "Participants:", paste(sort(unique(long_excl$participant)), collapse = ", "), "\n",
+    "Rows removed: 0\n")
+
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 1: Exclude RT1 < 300 ms 
+# ------------------------------------------------------------------------------
+
+# Read data set
+output_dir <- "Output"
+long_table <- read.csv(file.path(output_dir, "all_participants_excluding_outliers_long.csv"))
+
+# Keep a stable copy BEFORE RT-based exclusions (run once, or overwrite intentionally)
+write_csv(long_table, file.path(output_dir, "all_participants_pre_rt_exclusions_long.csv"))
+
+# Ensure RT is numeric
+long_table$slider_response1_2.rt <- suppressWarnings(
+  as.numeric(long_table$slider_response1_2.rt)
+)
+
+# Drop < 300 ms first
+rt_fast_thresh <- 0.300
+no_fast <- long_table %>%
+  filter(is.na(slider_response1_2.rt) | slider_response1_2.rt >= rt_fast_thresh)
+
+# Count <300 ms trials per participant
+fast_counts <- long_table %>%
+  mutate(
+    participant = as.integer(participant),
+    is_fast = !is.na(slider_response1_2.rt) & slider_response1_2.rt < rt_fast_thresh
+  ) %>%
+  summarise(
+    n_trials = dplyr::n(),
+    n_fast   = sum(is_fast, na.rm = TRUE),
+    prop_fast = n_fast / n_trials,
+    .by = participant
+  ) %>%
+  arrange(desc(n_fast))
+
+# Print 
+print(fast_counts)
+
+# Total across everyone
+cat("Total fast trials (<", rt_fast_thresh, "s): ",
+    sum(fast_counts$n_fast, na.rm = TRUE),
+    " out of ", sum(fast_counts$n_trials), " trials\n", sep = "")
+
+# Save to CSV
+write_csv(fast_counts, file.path(output_dir, "rt1_<300_counts_by_participant.csv"))
+
+
+# ------------------------------------------------------------
+# Trial-level exclusion 2 (recommended): within-participant × condition Tukey
+# compute Tukey bounds on TRIAL RTs, per participant × condition
+# ------------------------------------------------------------
+
+# Ensure rt column exists for the Tukey code below
+no_fast <- no_fast %>%
+  mutate(
+    participant = as.integer(participant),
+    synchrony = tolower(as.character(synchrony)),
+    directed_motion = tolower(as.character(directed_motion)),
+    rt = suppressWarnings(as.numeric(slider_response1_2.rt))
+  )
+
+bounds_wp <- no_fast %>%
+  group_by(participant, synchrony, directed_motion) %>%
+  summarise(
+    Q1 = quantile(rt, 0.25, na.rm = TRUE),
+    Q3 = quantile(rt, 0.75, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR,
+    n_trials = sum(!is.na(rt)),
+    .groups = "drop"
+  )
+
+write_csv(bounds_wp, file.path(output_dir, "rt1_tukey_bounds_within_participant_condition.csv"))
+
+# Join bounds back to trials and flag outliers
+trial_flagged <- no_fast %>%
+  left_join(bounds_wp, by = c("participant", "synchrony", "directed_motion")) %>%
+  mutate(
+    is_outlier_lower = !is.na(rt) & !is.na(Lower) & rt < Lower,
+    is_outlier_upper = !is.na(rt) & !is.na(Upper) & rt > Upper,
+    is_outlier       = is_outlier_lower | is_outlier_upper
+  )
+
+# ------------------------------------------------------------
+# Count outlier trials per participant × condition
+# ------------------------------------------------------------
+outlier_counts_by_pc <- trial_flagged %>%
+  group_by(participant, synchrony, directed_motion) %>%
+  summarise(
+    n_trials    = sum(!is.na(rt)),
+    n_below     = sum(is_outlier_lower, na.rm = TRUE),
+    n_above     = sum(is_outlier_upper, na.rm = TRUE),
+    n_outlier   = sum(is_outlier,       na.rm = TRUE),
+    prop_outlier = if_else(n_trials > 0, n_outlier / n_trials, NA_real_),
+    .groups = "drop"
+  ) %>%
+  arrange(synchrony, directed_motion, desc(n_outlier))
+
+overall_by_condition <- outlier_counts_by_pc %>%
+  group_by(synchrony, directed_motion) %>%
+  summarise(
+    total_trials   = sum(n_trials, na.rm = TRUE),
+    total_outliers = sum(n_outlier, na.rm = TRUE),
+    prop_outliers  = if_else(total_trials > 0, total_outliers / total_trials, NA_real_),
+    .groups = "drop"
+  )
+
+totals_by_participant <- outlier_counts_by_pc %>%
+  group_by(participant) %>%
+  summarise(
+    n_trials     = sum(n_trials, na.rm = TRUE),
+    n_outlier    = sum(n_outlier, na.rm = TRUE),
+    prop_outlier = if_else(n_trials > 0, n_outlier / n_trials, NA_real_),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(prop_outlier), desc(n_outlier))
+
+write_csv(outlier_counts_by_pc,
+          file.path(output_dir, "rt1_outlier_trial_counts_by_participant_condition.csv"))
+write_csv(overall_by_condition,
+          file.path(output_dir, "rt1_outlier_trial_counts_overall_by_condition.csv"))
+write_csv(totals_by_participant,
+          file.path(output_dir, "rt1_outlier_trial_counts_totals_by_participant.csv"))
+
+# ------------------------------------------------------------
+# OPTIONAL: exclude participants based on thresholds
+# (overall > 25% OR any condition > 50%)
+# ------------------------------------------------------------
+drop_ids <- outlier_counts_by_pc %>%
+  group_by(participant) %>%
+  summarise(
+    max_prop_cond = max(prop_outlier, na.rm = TRUE),
+    overall_prop  = sum(n_outlier, na.rm = TRUE) / sum(n_trials, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(overall_prop > 0.25 | max_prop_cond > 0.50) %>%
+  pull(participant)
+
+cat("Participants flagged for exclusion:", paste(drop_ids, collapse = ", "), "\n")
+
+# ------------------------------------------------------------
+# Drop outlier trials (and optionally flagged participants)
+# ------------------------------------------------------------
+dat_trim <- trial_flagged %>%
+  filter(!is_outlier) %>%                 # drop trial-level RT outliers
+  filter(!participant %in% drop_ids) %>%  # drop flagged participants (optional)
+  select(-rt, -Q1, -Q3, -IQR, -Lower, -Upper,
+         -is_outlier_lower, -is_outlier_upper, -is_outlier)
+
+# Save trimmed dataset
+write_csv(dat_trim, file.path(output_dir, "all_participants_rt1_trimmed_long.csv"))
+
+
+
+dat_before <- read_csv(file.path(output_dir, "all_participants_pre_rt_exclusions_long.csv"),
+                       show_col_types = FALSE) %>%
+  mutate(rt = suppressWarnings(as.numeric(slider_response1_2.rt)))
+
+dat_after <- read_csv(file.path(output_dir, "all_participants_rt1_trimmed_long.csv"),
+                      show_col_types = FALSE) %>%
+  mutate(rt = suppressWarnings(as.numeric(slider_response1_2.rt)))
+
+n_before <- sum(!is.na(dat_before$rt))
+n_after  <- sum(!is.na(dat_after$rt))
+
+n_excl    <- n_before - n_after
+prop_excl <- n_excl / n_before
+
+cat("RT1-valid trials BEFORE:", n_before, "\n")
+cat("RT1-valid trials AFTER: ", n_after, "\n")
+cat("Excluded trials:        ", n_excl, " (", round(100*prop_excl, 1), "%)\n", sep = "")
+
+
+# Save FINAL cleaned dataset under the main filename
+write_csv(dat_trim, file.path(output_dir, "all_participants_excluding_outliers_long.csv"))
+
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 2:  Build per-condition Tukey bounds on *participant mean RT1*
+# ------------------------------------------------------------------------------
+
+# Participant mean RT1 per condition (synchrony × directed_motion)
+means_by_pcond <- no_fast %>%
+  group_by(participant, synchrony, directed_motion) %>%
+  summarise(
+    mean_rt1 = mean(slider_response1_2.rt, na.rm = TRUE),
+    n_trials = sum(!is.na(slider_response1_2.rt)),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(mean_rt1))
+
+# Tukey bounds across participants for each condition (Q1/Q3/IQR)
+bounds <- means_by_pcond %>%
+  group_by(synchrony, directed_motion) %>%
+  summarise(
+    Q1   = quantile(mean_rt1, 0.25, na.rm = TRUE),
+    Q3   = quantile(mean_rt1, 0.75, na.rm = TRUE),
+    IQR  = Q3 - Q1,
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR,
+    n_participants = n(),
+    .groups = "drop"
+  )
+
+# Save to CSV
+write_csv(bounds, file.path(output_dir, "rt1_tukey_bounds_on_participant_means.csv"))
+
+# Print
+print(bounds)
+
+# Note:
+# synchrony directed_motion    Q1    Q3   IQR   Lower Upper n_participants
+# 1 high      absent           2.06  3.36 1.30   0.114   5.31             23
+# 2 high      present          1.79  2.82 1.03   0.240   4.37             23
+# 3 low       absent           2.17  3.03 0.856  0.889   4.31             23
+# 4 low       present          2.20  3.32 1.12   0.513   5.01             23
+# 5 medium    absent           2.10  3.56 1.46  -0.0828  5.74             23
+# 6 medium    present          1.83  2.62 0.785  0.657   3.80             23
+
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 2:  Boxplots
+# ------------------------------------------------------------------------------
+
+# Colours
+sync_cols <- c(
+  low    = "darkgreen",
+  medium = "grey60",
+  high   = "orange"
+)
+
+## A) Grouped boxplot (participant mean RT1), color = synchrony, x = directed motion
+# Only show outliers
+p_grouped <- ggplot(
+  means_by_pcond,
+  aes(
+    x = factor(directed_motion,
+               levels = c("present","absent"),
+               labels = c("Present","Absent")),   # <- Capitalized labels
+    y = mean_rt1,
+    fill = factor(synchrony, levels = c("low","medium","high"))
+  )
+) +
+  geom_boxplot(alpha = 0.7, color = "grey30", outlier.alpha = 0.25) +
+  scale_fill_manual(values = sync_cols, breaks = c("low","medium","high"),
+                    labels = c("Low","Medium","High")) +
+  labs(
+    x = "Directed Motion", y = "Participant's Mean Response Times (s)", fill = "Synchrony",
+  ) +
+  theme_minimal(base_size = 14)
+
+# Print
+print(p_grouped)
+
+# Save as PNG
+ggsave(file.path(output_dir, "boxplot_meanRT1_by_synchrony_directed.png"),
+       p_grouped, width = 9, height = 6, dpi = 300)
+
+  
+# compute outlier flags for each participant mean ---
+  pos_dodge <- position_dodge(width = 0.75)
+
+means_flagged <- means_by_pcond %>%
+  dplyr::left_join(bounds, by = c("synchrony","directed_motion")) %>%
+  dplyr::mutate(
+    is_outlier = mean_rt1 < Lower | mean_rt1 > Upper
+  )
+
+## B) Same boxplot but: show all participants' mean RTs faintly 
+
+p_grouped <- ggplot(
+  means_by_pcond,
+  aes(
+    x = factor(directed_motion,
+               levels = c("present","absent"),
+               labels = c("Present","Absent")),   # <- Capitalized labels
+    y = mean_rt1,
+    fill = factor(synchrony, levels = c("low","medium","high"))
+  )
+) +
+  
+  # Hide default boxplot outlier points so we control what gets drawn
+  geom_boxplot(position = pos_dodge, alpha = 0.7, color = "grey30",
+               outlier.shape = NA) +
+  # Draw all points 
+  geom_point(data = means_flagged,
+             aes(color = factor(synchrony, levels = c("low","medium","high"))),
+             position = pos_dodge, size = 1.8, alpha = 0.35, show.legend = FALSE) +
+  scale_fill_manual(values = sync_cols, breaks = c("low","medium","high"),
+                    labels = c("Low","Medium","High")) +
+  scale_color_manual(values = sync_cols, guide = "none") +
+  labs(
+    x = "Directed Motion", y = "Participant's Mean Response Times (s)", fill = "Synchrony",
+  ) +
+  theme_minimal(base_size = 14)
+
+# Print
+print(p_grouped)
+
+# Save as PNG
+ggsave(file.path(output_dir, "boxplot_meanRT1_with_explicit_outliers.png"),
+       p_grouped, width = 9, height = 6, dpi = 300)
+
+
+## C) Same boxplot but: label outlier means with participant IDs 
+
+means_flagged <- means_by_pcond %>%
+  dplyr::left_join(bounds, by = c("synchrony","directed_motion")) %>%
+  dplyr::mutate(is_outlier = mean_rt1 < Lower | mean_rt1 > Upper)
+
+means_flagged <- means_flagged %>%
+  dplyr::mutate(label = ifelse(is.na(participant), NA, paste0("P", participant)))
+
+pos_dodge <- position_dodge(width = 0.75)
+
+p_grouped_labeled <- ggplot(
+  means_flagged,
+  aes(x = factor(directed_motion, levels = c("present","absent")),
+      y = mean_rt1,
+      fill = factor(synchrony, levels = c("low","medium","high")))
+) +
+  
+  geom_boxplot(position = pos_dodge, alpha = 0.7, color = "grey30",
+               outlier.shape = NA) +
+  
+  geom_point(aes(color = factor(synchrony, levels = c("low","medium","high"))),
+             position = pos_dodge, size = 1.6, alpha = 0.35, show.legend = FALSE) +
+ 
+  geom_text_repel(
+    data = dplyr::filter(means_flagged, is_outlier),
+    aes(label = label,
+        x = factor(directed_motion, levels = c("present","absent")),
+        y = mean_rt1),
+    position = pos_dodge,
+    inherit.aes = FALSE,
+    size = 3.6,
+    fontface = "bold",
+    min.segment.length = 0,
+    segment.alpha = 0.6,
+    box.padding = 0.25,
+    point.padding = 0.2
+  ) +
+  scale_fill_manual(values = sync_cols, breaks = c("low","medium","high"),
+                    labels = c("Low","Medium","High")) +
+  scale_color_manual(values = sync_cols, guide = "none") +
+  labs(
+    x = "Directed Motion", y = "Participant's Mean Response Times (s)", fill = "Synchrony",
+  ) +
+  theme_minimal(base_size = 14)
+
+# Print
+print(p_grouped_labeled)
+
+# Save as PNG
+ggsave(file.path(output_dir, "boxplot_meanRT1_with_outlier_labels.png"),
+       p_grouped_labeled, width = 9, height = 6, dpi = 300)
+
+
+# ------------------------------------------------------------------------------
+# Social Influence Exclusions
+# ------------------------------------------------------------------------------
+
+# Exclusion Criteria: 
+# 1) Exclude feedback_type == "random"
+# 2) Drop R1 == X
+# 3) Adjust R2:
+#    (i) tiny overshoot (|R2−X| ≤ 2)  → R2_adj = X
+#    (ii) tiny move in the opposite direction (≤ 2 units beyond R1) → R2_adj = R1
+#    else R2_adj = R2
+# 4) Compute s = (R2_adj − R1) / (X − R1); keep only 0 ≤ s ≤ 1
+# 5) Keep all |X − R1| magnitudes (no gap-based exclusions)
+
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Parameters 
+tiny <- 2      # units on the slider considered "tiny"
+eps  <- 1e-8   # numerical safety to avoid 0 division
+
+# Base prep 
+
+base <- dat %>%
+  mutate(
+    feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+    R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Advice_raw = case_when(
+      feedback_type_clean %in% c("over","overestimator","overestimate")    ~ "Over",
+      feedback_type_clean %in% c("under","underestimator","underestimate") ~ "Under",
+      TRUE ~ feedback_type_clean
+    ),
+    Directed_Motion_raw = ifelse(str_detect(tolower(directed_motion), "present|dp"), "Present", "Absent"),
+    Synchrony_raw = case_when(
+      str_detect(tolower(synchrony), "high|hs|^h\\b")   ~ "High",
+      str_detect(tolower(synchrony), "medium|ms|^m\\b") ~ "Medium",
+      str_detect(tolower(synchrony), "low|ls|^l\\b")    ~ "Low",
+      TRUE ~ as.character(synchrony)
+    )
+  )
+
+# Helper: select transparent report columns
+select_report_cols <- function(df) {
+  keep <- intersect(c(
+    names(dat),
+    "R1","R2","X","R2_adj","s",
+    "Advice_raw","Directed_Motion_raw","Synchrony_raw"
+  ), names(df))
+  df %>% select(all_of(keep))
+}
+
+# Containers to log exclusions/flags
+ex_log <- list()
+flag_log <- list()
+
+# Exclusion: non-finite R1/R2/X
+ex_nonfinite <- base %>%
+  filter(!is.finite(R1) | !is.finite(R2) | !is.finite(X)) %>%
+  mutate(exclusion_reason = "Non-finite R1/R2/X")
+ex_log[["nonfinite"]] <- select_report_cols(ex_nonfinite)
+
+df1 <- base %>% filter(is.finite(R1), is.finite(R2), is.finite(X))
+
+# Exclusion: random advice
+is_random <- function(a) tolower(a) %in% c("random","rnd","rand")
+ex_random <- df1 %>%
+  filter(is_random(Advice_raw)) %>%
+  mutate(exclusion_reason = "Random advice")
+ex_log[["random"]] <- select_report_cols(ex_random)
+
+df2 <- df1 %>% filter(is.na(Advice_raw) | !is_random(Advice_raw))
+
+#  Coerce factors for the kept stream
+si0 <- df2 %>%
+  mutate(
+    Advice          = factor(Advice_raw, levels = c("Under","Over")),
+    Directed_Motion = factor(Directed_Motion_raw, levels = c("Present","Absent")),
+    Synchrony       = factor(Synchrony_raw, levels = c("High","Medium","Low")),
+    participant     = factor(participant_ID)
+  )
+
+# Report two specific counts you asked about (on si0)
+flag_df <- si0 %>%
+  mutate(gap = abs(X - R1),
+         reason_equalRX = (R1 == X),
+         reason_gaplt25 = (gap < 25))
+
+ex_equalRX_view <- flag_df %>% filter(reason_equalRX)   # overlaps with gap<25
+ex_gaplt25_view <- flag_df %>% filter(reason_gaplt25)
+
+# Print counts 
+cat("\nSpecific reasons (computed on si0, before SIU adjustments and s-filter):\n")
+cat("  (1) X == R1:                  ", nrow(ex_equalRX_view), "\n")
+cat("  (2) |X - R1| < 25:            ", nrow(ex_gaplt25_view), "\n")
+cat("      Overlap of (1) and (2):   ",
+    nrow(flag_df %>% filter(reason_equalRX & reason_gaplt25)), "\n")
+cat("      Union (unique rows):      ",
+    nrow(flag_df %>% filter(reason_equalRX | reason_gaplt25)),  "\n")
+
+
+# Prep, flags, and adjustments
+# tiny overall = flagged only (no adjustment)
+# tiny opposite / tiny overshoot = adjusted
+prep0 <- si0 %>%
+  mutate(
+    denom     = X - R1,
+    num       = R2 - R1,
+    equal_RX  = (R1 == X),                    # exclusion below
+    toward    = sign(denom) * num >= 0,
+    away      = sign(denom) * num <  0,
+    overshoot = sign(denom) * (R2 - X) > 0,
+    
+    move_mag        = abs(num),
+    overshoot_mag   = abs(R2 - X),
+    
+    small_overall   = move_mag <= tiny,
+    small_opposite  = away & (move_mag <= tiny),
+    small_overshoot = overshoot & (overshoot_mag <= tiny)
+  )
+
+# Exclusion: X == R1 (advice impossible)
+ex_equal <- prep0 %>%
+  filter(equal_RX) %>%
+  mutate(exclusion_reason = "X == R1 (advice impossible)")
+ex_log[["equalRX"]] <- select_report_cols(ex_equal)
+
+prep <- prep0 %>%
+  filter(!equal_RX) %>%
+  mutate(
+    R2_adj = case_when(
+      small_overshoot ~ X,   # adjust tiny overshoot
+      small_opposite  ~ R1,  # adjust tiny opposite
+      TRUE            ~ R2   # tiny overall: no adjustment
+    ),
+    s = (R2_adj - R1) / pmax(abs(denom), eps) * sign(denom),
+    drop_neg = s < 0,   # big opposite
+    drop_pos = s > 1    # big overshoot
+  )
+
+
+# Exclusions after s: s<0 or s>1
+ex_sneg <- prep %>% filter(drop_neg) %>% mutate(exclusion_reason = "s < 0 (big opposite)")
+ex_spos <- prep %>% filter(drop_pos) %>% mutate(exclusion_reason = "s > 1 (big overshoot)")
+ex_log[["s_neg"]] <- select_report_cols(ex_sneg)
+ex_log[["s_pos"]] <- select_report_cols(ex_spos)
+
+
+# Final kept trials for SIU (keep original structure)
+siu_clean <- prep %>%
+  filter(!drop_neg, !drop_pos, is.finite(s)) %>%
+  select(
+    participant,
+    participant_ID,
+    condition,
+    synchrony,
+    directed_motion,
+    movie_file,
+    feedback_type,
+    `slider_response1_2.response`,
+    `slider_response1_2.rt`,
+    agent_feedback,
+    `slider_response2_2.response`,
+    `slider_response2_2.rt`,
+    R2_adj,
+    s
+  )
+
+stopifnot(nrow(siu_clean) > 0)
+
+write_csv(siu_clean, file.path(output_dir, "siu_trials_clean.csv"))
+cat("\nSaved SIU-clean trials to:",
+    file.path(output_dir, "siu_trials_clean.csv"), "\n")
+
+# Summaries (printed)
+adj_summary <- prep %>%
+  transmute(reason = case_when(
+    small_overshoot                    ~ "Adjusted: tiny overshoot (R2:=X)",
+    small_opposite                     ~ "Adjusted: tiny opposite (R2:=R1)",
+    small_overall & !small_opposite    ~ "Flagged: tiny overall (no adjustment)",
+    TRUE                               ~ "No small adjustment"
+  )) %>%
+  count(reason) %>%
+  arrange(desc(n))
+
+keepdrop_summary <- prep %>%
+  transmute(reason = case_when(
+    drop_neg ~ "Dropped: s<0 (big opposite)",
+    drop_pos ~ "Dropped: s>1 (big overshoot)",
+    TRUE     ~ "Kept: 0≤s≤1"
+  )) %>%
+  count(reason) %>%
+  arrange(desc(n))
+
+by_advice <- prep %>%
+  filter(!drop_neg, !drop_pos, is.finite(s)) %>%
+  count(Advice, Directed_Motion, Synchrony) %>%
+  arrange(Advice, Directed_Motion, Synchrony)
+
+cat("\nAdjustment summary:\n"); print(adj_summary)
+cat("\nPost-adjustment keep/drop summary:\n"); print(keepdrop_summary)
+cat("\nFinal kept trials by Advice × Directed × Synchrony:\n"); print(by_advice)
