@@ -1,0 +1,1624 @@
+# Columns: 
+# participant_ID
+# condition: HSDP, MSDP, LSDP, HSDA, MSDA, LSDA
+# synchrony: high (HS), medium (MS), low (LS)
+# directed_motion: present (DP), absent (DA)
+# feedback_type: over, under, random (will not be analysed)
+# slider_response1_2.response: first response on a slider -100 to +100
+# slider_response1_2.rt: RT of first response 
+# agent_feedback: + 25, -25 or random based on the participant's response
+# slider_response2_2.response: second response on a slider -100 to +100
+# slider_response2_2.rt: RT of second response
+
+# ------------------------------------------------------------------------------
+# Load Required Libraries
+# ------------------------------------------------------------------------------
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggrepel)
+library(lme4) 
+library(glmmTMB)     
+library(emmeans)     
+library(performance) 
+library(tibble)
+library(car)          
+library(broom.mixed)
+library(tidyverse)
+  
+# ------------------------------------------------------------------------------
+# Set Working Directory and Clear Workspace
+# ------------------------------------------------------------------------------
+
+# Clear the workspace
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2025/PhD/Paper3_Social_Influence/R_Code")
+
+input_dir  <- "DISCS_csv"   # relative to your working dir
+output_dir <- "Output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------------------------
+# Main Analysis, Pre-Social Influence
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Analysis 1: Pre Social Influence Mediation Models 
+# Binary Response ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build binary DV and factors
+df_bin <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    Directed_Motion = factor(
+      ifelse(grepl("present|\\bdp\\b", tolower(directed_motion)), "Present",
+             ifelse(grepl("absent|\\bda\\b",  tolower(directed_motion)), "Absent", NA)),
+      levels = c("Present","Absent")
+    ),
+    Synchrony = factor(dplyr::case_when(
+      grepl("high|\\bhs\\b|^h\\b",   tolower(synchrony)) ~ "High",
+      grepl("medium|\\bms\\b|^m\\b", tolower(synchrony)) ~ "Medium",
+      grepl("low|\\bls\\b|^l\\b",    tolower(synchrony)) ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    levels = c("High","Medium","Low")
+    ),
+    # Yes=1 if r1>0, No=0 if r1<0; exact zero = NA (excluded)
+    chase_bin = dplyr::case_when(
+      is.finite(r1) & r1 >  0 ~ 1L,
+      is.finite(r1) & r1 <  0 ~ 0L,
+      is.finite(r1) & r1 == 0 ~ NA_integer_,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  filter(!is.na(Directed_Motion), !is.na(Synchrony), !is.na(chase_bin)) %>%
+  droplevels()
+
+# Effect coding (sum-to-zero)
+contrasts(df_bin$Directed_Motion) <- contr.sum(2)
+contrasts(df_bin$Synchrony)       <- contr.sum(3)
+
+# Fit mixed-effects logistic regression
+m_logit_ec <- glmer(
+  chase_bin ~ Synchrony * Directed_Motion + (1 | participant),
+  data = df_bin,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(m_logit_ec)
+
+# Type III Wald χ² tests 
+cat("\n--- Type III tests (Wald χ²) for main effects and interaction ---\n")
+print(car::Anova(m_logit_ec, type = "III"))
+
+# Block LRT for the interaction (does the 2-way add beyond main effects?)
+m_main <- update(m_logit_ec, . ~ Synchrony + Directed_Motion + (1 | participant))
+cat("\n--- Block test: does Synchrony×Directed Motion improve fit? (LRT) ---\n")
+print(anova(m_main, m_logit_ec))  # Likelihood-ratio test
+
+# Simple effects
+# (A) Directed Motion within each Synchrony — log-odds differences (Holm for two levels)
+emm_DM_within_S <- emmeans(m_logit_ec, ~ Directed_Motion | Synchrony, type = "link")
+pairs_DM_logit <- pairs(emm_DM_within_S, adjust = "holm")
+
+out_DM_logit <- summary(pairs_DM_logit, infer = TRUE, level = .95) %>%
+  as.data.frame() %>%
+  mutate(
+    contrast = gsub("Present - Absent", "Present vs Absent", contrast, fixed = TRUE)
+  ) %>%
+  select(
+    Synchrony,
+    contrast,
+    logOR = estimate,
+    LCL = asymp.LCL,
+    UCL = asymp.UCL,
+    z = z.ratio,
+    p = p.value
+  )
+
+cat("\nSimple effects — Directed Motion within each Synchrony — LOG-ODDS (log OR):\n")
+print(out_DM_logit, row.names = FALSE)
+
+# (B) Synchrony within each Directed Motion — log-odds differences (Tukey for 3 levels)
+emm_S_within_DM <- emmeans(m_logit_ec, ~ Synchrony | Directed_Motion, type = "link")
+pairs_S_logit <- pairs(emm_S_within_DM, adjust = "tukey")
+
+out_S_logit <- summary(pairs_S_logit, infer = TRUE, level = .95) %>%
+  as.data.frame() %>%
+  select(
+    Directed_Motion,
+    contrast,
+    logOR = estimate,
+    LCL = asymp.LCL,
+    UCL = asymp.UCL,
+    z = z.ratio,
+    p = p.value
+  )
+
+cat("\nSimple effects — Synchrony within each Directed Motion — LOG-ODDS (log OR):\n")
+print(out_S_logit, row.names = FALSE)
+
+# EMM: Probabilities by margins 
+emm_DM_within_S_prob <- emmeans(m_logit_ec, ~ Directed_Motion | Synchrony, type = "response")
+emm_S_within_DM_prob <- emmeans(m_logit_ec, ~ Synchrony | Directed_Motion, type = "response")
+
+cat("\nDirected_Motion within Synchrony (probabilities):\n"); print(emm_DM_within_S_prob)
+cat("\nSynchrony within Directed_Motion (probabilities):\n"); print(emm_S_within_DM_prob)
+
+# ------------------------------------------------------------------------------
+# Analysis 2: Pre Social Influence Mediation Models 
+# Slider ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# Build analysis df (slider)
+df_r1 <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    Directed_Motion = factor(
+      ifelse(grepl("present|\\bdp\\b", tolower(directed_motion)), "Present",
+             ifelse(grepl("absent|\\bda\\b",  tolower(directed_motion)), "Absent", NA)),
+      levels = c("Present","Absent")
+    ),
+    Synchrony = factor(dplyr::case_when(
+      grepl("high|\\bhs\\b|^h\\b",   tolower(synchrony)) ~ "High",
+      grepl("medium|\\bms\\b|^m\\b", tolower(synchrony)) ~ "Medium",
+      grepl("low|\\bls\\b|^l\\b",    tolower(synchrony)) ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    levels = c("High","Medium","Low"))
+  ) %>%
+  filter(is.finite(r1), !is.na(Directed_Motion), !is.na(Synchrony)) %>%
+  droplevels()
+
+# Effect coding (sum-to-zero)
+contrasts(df_r1$Directed_Motion) <- contr.sum(2)
+contrasts(df_r1$Synchrony)       <- contr.sum(3)
+
+# LMM on the raw slider
+m_r1 <- lmer(r1 ~ Synchrony * Directed_Motion + (1 | participant), data = df_r1)
+summary(m_r1)
+
+# Type III tests (Wald) for main effects and interaction
+cat("\n--- Type III tests (Wald) for main effects and interaction ---\n")
+print(car::Anova(m_r1, type = "III"))   # default = Wald Chi-square for lme4::lmer
+
+# Block LRT for the Synchrony × Directed Motion interaction
+# IMPORTANT: use ML (REML = FALSE) for fixed-effect model comparisons.
+m_r1_ml   <- update(m_r1, REML = FALSE)
+m_main_ml <- lmer(r1 ~ Synchrony + Directed_Motion + (1 | participant),
+                  data = df_r1, REML = FALSE)
+
+cat("\n--- Block test: does Synchrony×Directed Motion improve fit? (LRT, ML) ---\n")
+print(anova(m_main_ml, m_r1_ml))  # Likelihood-ratio test for the 2-way interaction
+
+# Simple effects
+# (A) Directed Motion within Synchrony
+# (mean differences on the slider scale)
+
+emm_DM_within_S_r1 <- emmeans(m_r1, ~ Directed_Motion | Synchrony)
+DM_within_S_diff   <- summary(pairs(emm_DM_within_S_r1, adjust = "holm"), infer = TRUE)
+
+cat("\nSimple effects — Directed Motion within each Synchrony (mean differences on slider):\n")
+print(DM_within_S_diff)
+
+# Standardized effect size (Cohen's d) for those simple effects
+DM_within_S_d <- eff_size(emm_DM_within_S_r1, sigma = sigma(m_r1), edf = df.residual(m_r1))
+cat("\nEffect sizes (Cohen's d) — Directed Motion within each Synchrony:\n")
+print(DM_within_S_d)
+
+# (B) Synchrony within Directed Motion
+# (pairwise mean differences)
+
+emm_S_within_DM_r1 <- emmeans(m_r1, ~ Synchrony | Directed_Motion)
+S_within_DM_diff   <- summary(pairs(emm_S_within_DM_r1, adjust = "tukey"), infer = TRUE)
+
+cat("\nSimple effects — Synchrony within each Directed Motion (mean differences on slider):\n")
+print(S_within_DM_diff)
+
+# Standardized effect sizes
+S_within_DM_d <- eff_size(emm_S_within_DM_r1, sigma = sigma(m_r1), edf = df.residual(m_r1))
+cat("\nEffect sizes (Cohen's d) — Synchrony within each Directed Motion:\n")
+print(S_within_DM_d)
+
+# EMM
+emm_cells_r1 <- emmeans(m_r1, ~ Synchrony * Directed_Motion)
+cat("\nCell means — Synchrony × Directed Motion (slider scale):\n")
+print(emm_cells_r1)
+
+# ------------------------------------------------------------------------------
+# Analysis 3: Pre Social Influence Mediation Models 
+# Confidence ~ Synchrony * Directed Motion
+# ------------------------------------------------------------------------------
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+## Build confidence-strength outcome (0..1), apply SV squeeze
+dfc <- dat %>%
+  mutate(
+    participant = factor(participant_ID),
+    r1   = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+    conf = pmin(pmax(abs(r1)/100, 0), 1),  # 0..1
+    Directed_Motion = factor(
+      ifelse(str_detect(tolower(directed_motion), "present|\\bdp\\b"), "Present", "Absent"),
+      levels = c("Present","Absent")
+    ),
+    Synchrony = factor(case_when(
+      str_detect(tolower(synchrony), "high|\\bhs\\b|^h\\b")   ~ "High",
+      str_detect(tolower(synchrony), "medium|\\bms\\b|^m\\b") ~ "Medium",
+      str_detect(tolower(synchrony), "low|\\bls\\b|^l\\b")    ~ "Low",
+      TRUE ~ NA_character_
+    ), levels = c("High","Medium","Low"))
+  ) %>%
+  filter(!is.na(Directed_Motion), !is.na(Synchrony), is.finite(conf)) %>%
+  droplevels()
+
+N <- nrow(dfc)
+dfc <- dfc %>% mutate(conf_sv = (conf * (N - 1) + 0.5) / N)  # Smithson–Verkuilen
+
+## Effect coding (sum-to-zero) — set on the columns used in the model
+contrasts(dfc$Directed_Motion) <- contr.sum(2)  # column named "Directed_Motion1"
+contrasts(dfc$Synchrony)       <- contr.sum(3)  # columns "Synchrony1","Synchrony2"
+
+## Beta GLMM with logit link
+m_conf <- glmmTMB(
+  conf_sv ~ Synchrony * Directed_Motion + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = dfc
+)
+summary(m_conf)
+
+#  Type III Wald χ² tests for main effects and interaction
+cat("\n--- Type III tests (Wald χ²) for main effects and interaction ---\n")
+print(car::Anova(m_conf, type = "III"))
+
+# Block LRT: does the Synchrony × Directed_Motion interaction improve fit?
+m_conf_main <- glmmTMB(
+  conf_sv ~ Synchrony + Directed_Motion + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = dfc
+)
+cat("\n--- Block test: does Synchrony×Directed Motion improve fit? (LRT) ---\n")
+print(anova(m_conf_main, m_conf))  # interaction vs main-effects-only
+
+# Simple effects 
+# A) Directed Motion within each level of Synchrony
+
+# EMMs on response scale
+emm_DM_within_S_resp <- emmeans(m_conf, ~ Directed_Motion | Synchrony, type = "response")
+
+# Re-grid so that the working scale is the response (not link) scale
+emm_DM_within_S_resp <- regrid(emm_DM_within_S_resp, transform = "response")
+
+# Now pairwise differences are Δ in mean confidence (0..1), Holm-adjusted
+DM_within_S_diff_resp <- summary(
+  pairs(emm_DM_within_S_resp, adjust = "holm"),
+  infer = TRUE
+)
+
+print(DM_within_S_diff_resp)
+# 'estimate' here is Present - Absent in absolute confidence units (0..1)
+
+# B) Synchrony within each level of Directed Motion
+emm_S_within_DM_resp <- emmeans(m_conf, ~ Synchrony | Directed_Motion, type = "response")
+
+# Ensure contrasts are computed on the response (0..1) scale
+emm_S_within_DM_resp <- regrid(emm_S_within_DM_resp, transform = "response")
+
+# All pairwise differences among Synchrony (High, Medium, Low); Tukey correction
+S_within_DM_diff <- summary(
+  pairs(emm_S_within_DM_resp, adjust = "tukey"),
+  infer = TRUE
+)
+
+cat("\nSimple effects — Synchrony within each Directed Motion (DIFFERENCES in mean confidence 0..1):\n")
+print(S_within_DM_diff)
+
+emmeans(m_conf, ~ Synchrony * Directed_Motion, type = "response")
+
+# ------------------------------------------------------------------------------
+# MAIN ANALYSES: SOCIAL INFLUENCE ON JUDGMENTS
+# ------------------------------------------------------------------------------
+
+# These analyses examine how participants integrate social advice into their
+# judgments (Social Information Use; SIU), and whether this integration depends
+# on stimulus features (Directed Motion, Synchrony) and individual confidence.
+#
+# SIU is continuous and bounded in [0,1]; therefore, all models are beta
+# mixed-effects models with participant-level random intercepts.
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# ANALYSIS 1: SOCIAL INFORMATION USE
+# MODEL 1: Advice × Directed Motion × Synchrony
+# ------------------------------------------------------------------------------
+
+# Research question:
+# Does the extent to which participants use social advice (SIU) depend on:
+#   (a) advice direction (Under vs Over),
+#   (b) stimulus features (Directed Motion, Synchrony),
+#   and (c) their interactions?
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Data preparation
+# ------------------------------------------------------------------------------
+
+# Read pre-cleaned trial-level dataset
+d <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,  # initial estimate
+    X  = agent_feedback,               # social (advice) value
+    R2 = slider_response2_2.response,  # revised estimate
+    R2_adj = R2_adj,                   # adjusted revision (cleaned)
+    s  = s                             # social information use index
+  ) %>%
+  mutate(
+    participant = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion),
+                             levels = c("Present","Absent")),
+    Synchrony       = factor(str_to_title(synchrony),
+                             levels = c("High","Medium","Low")),
+    Advice          = factor(str_to_lower(feedback_type),
+                             levels = c("under","over"),
+                             labels = c("Under","Over")),
+    A    = X - R1,       # signed advice magnitude
+    absA = abs(A)        # absolute advice magnitude (covariate)
+  ) %>%
+  filter(is.finite(s))   # remove any missing/non-finite SIU values
+
+# ------------------------------------------------------------------------------
+# Transformation and coding
+# ------------------------------------------------------------------------------
+
+# Apply Smithson–Verkuilen squeeze transformation to keep s in (0,1)
+N <- nrow(d)
+d <- d %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+
+# Set sum-to-zero contrasts (required for Type III tests)
+contrasts(d$Advice)          <- contr.sum(2)
+contrasts(d$Directed_Motion) <- contr.sum(2)
+contrasts(d$Synchrony)       <- contr.sum(3)
+
+# ------------------------------------------------------------------------------
+# Model fitting: hierarchical (nested) structure
+# ------------------------------------------------------------------------------
+
+# Baseline model: only advice direction and covariate (no stimulus effects)
+m_noStim <- glmmTMB(
+  s_sv ~ Advice + absA + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Add main and interaction effects of Directed Motion and Synchrony
+m_addStim <- glmmTMB(
+  s_sv ~ Advice + Directed_Motion * Synchrony + absA + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Full model: include all Advice × Stimulus interactions
+m_full <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# ------------------------------------------------------------------------------
+# Hierarchical model comparisons (likelihood-ratio block tests)
+# ------------------------------------------------------------------------------
+
+# Step 1: Does adding Advice Direction improve model fit?
+m_noAdvice <- glmmTMB(
+  s_sv ~ absA + (1|participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+m_adviceOnly <- update(m_noAdvice, . ~ . + Advice)
+anova(m_noAdvice, m_adviceOnly)  # LRT for global (main) effect of Advice
+
+# Step 2: Do stimulus features improve model fit?
+cat("\n--- Block test: Stimulus (Directed Motion, Synchrony, Directed×Synchrony) ---\n")
+print(anova(m_noStim, m_addStim))
+
+# Step 3: Do Advice × Stimulus interactions improve model fit?
+cat("\n--- Block test: Advice×Stimulus interactions ---\n")
+print(anova(m_addStim, m_full))
+
+
+# ------------------------------------------------------------------------------
+# Full model inference
+# ------------------------------------------------------------------------------
+
+# Inspect fixed-effect estimates (logit scale)
+summary(m_full)
+
+# Type III Wald χ² tests for main and interaction effects
+cat("\n--- Type III tests from the full model (sum coding) ---\n")
+print(car::Anova(m_full, type = "III"))
+
+# Likelihood-ratio test for the 3-way interaction
+m_no3 <- update(m_full, . ~ . - Advice:Directed_Motion:Synchrony)
+anova(m_no3, m_full)
+
+
+# ------------------------------------------------------------------------------
+# Estimated marginal means and simple-effects decomposition
+# ------------------------------------------------------------------------------
+
+# Obtain estimated means (response scale, 0–1) for all cells
+emm_full <- emmeans(m_full, ~ Advice * Directed_Motion * Synchrony, type = "response")
+print(emm_full)
+
+# Simple effects of Advice within each Directed×Synchrony cell
+se_advice <- pairs(emm_full, by = c("Directed_Motion","Synchrony"), adjust = "holm")
+cat("\n--- Simple effects: Advice within each Directed×Synchrony cell ---\n")
+print(se_advice)
+
+# Simple effects of Synchrony within each Advice×Directed cell
+se_sync <- pairs(emm_full, by = c("Advice","Directed_Motion"), adjust = "tukey")
+cat("\n--- Simple effects: Synchrony within each Advice×Directed cell ---\n")
+print(se_sync)
+
+# Simple effects of Directed Motion within each Advice×Synchrony cell
+se_dm <- pairs(emm_full, by = c("Advice","Synchrony"), adjust = "holm")
+cat("\n--- Simple effects: Directed Motion within each Advice×Synchrony cell ---\n")
+print(se_dm)
+
+# ------------------------------------------------------------------------------
+# Decomposition of significant two-way interactions
+# ------------------------------------------------------------------------------
+
+# Hold covariates at sensible values and average equally over the other factor
+emm_at <- list(absA = mean(d$absA, na.rm = TRUE))
+
+## Helper: contrasts as DIFFERENCES on the response (SIU) scale
+# (regrid() moves EMMs to response scale so pairwise = mean differences, Δ)
+diff_resp <- function(emm) {
+  contrast(regrid(emm, transform = "response"), "revpairwise", adjust = "holm")
+}
+
+# A) Advice × Directed_Motion: Advice simple effects within DM,
+# COLLAPSING over Synchrony
+emm_adv_by_dm <- emmeans(
+  m_full, ~ Advice | Directed_Motion,
+  at = emm_at, weights = "equal"          # equal averaging over Synchrony
+)
+se_adv_by_dm <- diff_resp(emm_adv_by_dm)
+cat("\n--- Simple effects (collapsed): Advice within Directed_Motion ---\n")
+print(se_adv_by_dm)
+
+# B) Advice × Synchrony: Advice simple effects within Synchrony,
+# COLLAPSING over Directed_Motion
+emm_adv_by_syn <- emmeans(
+  m_full, ~ Advice | Synchrony,
+  at = emm_at, weights = "equal"          # equal averaging over DM
+)
+se_adv_by_syn <- diff_resp(emm_adv_by_syn)
+cat("\n--- Simple effects (collapsed): Advice within Synchrony ---\n")
+print(se_adv_by_syn)
+
+# C) Directed_Motion simple effects within Advice,
+# COLLAPSING over Synchrony
+emm_dm_by_adv <- emmeans(
+  m_full, ~ Directed_Motion | Advice,
+  at = emm_at, weights = "equal"
+)
+se_dm_by_adv <- diff_resp(emm_dm_by_adv)
+cat("\n--- Simple effects (collapsed): Directed_Motion within Advice ---\n")
+print(se_dm_by_adv)
+
+# D) Synchrony simple effects within Advice,
+# COLLAPSING over Directed_Motion (3 levels → Tukey adjust)
+emm_syn_by_adv <- emmeans(
+  m_full, ~ Synchrony | Advice,
+  at = emm_at, weights = "equal"
+)
+
+# Get pairwise differences (Δ) on the SIU (response) scale with p-values
+syn_pairs_resp <- pairs(regrid(emm_syn_by_adv, transform = "response"),
+                        adjust = "tukey")
+print(syn_pairs_resp)
+
+
+emmeans(m_full, ~ Advice * Directed_Motion,
+        at = emm_at, weights = "equal",
+        type = "response")
+
+emmeans(m_full, ~ Advice * Synchrony,
+        at = emm_at, weights = "equal",
+        type = "response")
+
+
+
+d_scale_check <- d %>%
+  summarise(
+    R1_min = min(R1, na.rm = TRUE),
+    R1_max = max(R1, na.rm = TRUE),
+    X_min  = min(X,  na.rm = TRUE),
+    X_max  = max(X,  na.rm = TRUE),
+    R2_min = min(R2, na.rm = TRUE),
+    R2_max = max(R2, na.rm = TRUE)
+  )
+
+print(d_scale_check)
+
+d_distance_check <- d %>%
+  mutate(absA = abs(X - R1))
+
+summary(d_distance_check$absA)
+quantile(d_distance_check$absA, probs = seq(0,1,.1), na.rm = TRUE)
+
+d_extreme <- d %>%
+  mutate(absA = abs(X - R1)) %>%
+  filter(absA > 30)
+
+nrow(d_extreme)
+
+d_extreme %>%
+  select(R1, X, absA) %>%
+  arrange(desc(absA)) %>%
+  head(10)
+
+d %>%
+  mutate(absA = abs(X - R1)) %>%
+  summarise(
+    total_trials = n(),
+    n_large_shift = sum(absA > 30),
+    prop_large_shift = mean(absA > 30)
+  )
+
+
+# ==============================================================================
+# MAIN ANALYSES: SOCIAL INFORMATION USE (SIU)
+# - Model 1: Advice × Directed Motion × Synchrony
+# - Model 2: Confidence moderation (within–between decomposition)
+# - EMMs (for supplement + Figure 4 style) and simple effects
+#
+# Notes:
+# - SIU is modeled with beta GLMM (logit link) using glmmTMB
+# - SIU is Smithson–Verkuilen “squeezed” into (0,1)
+# - Contrasts are sum-to-zero (effect coding) for Type III Wald χ² tests
+# - Confidence is decomposed into:
+#     conf_WP_z = within-person centered and z-scaled
+#     conf_BP_z = between-person mean confidence (participant mean), z-scaled
+# - Advice magnitude is absA_z = z-scored |X − R1|
+# ==============================================================================
+
+# ==============================================================================
+# 0) Helpers
+# ==============================================================================
+
+sv_squeeze <- function(x) {
+  # Smithson–Verkuilen squeeze to map [0,1] -> (0,1)
+  # uses sample size N of the vector provided
+  N <- sum(is.finite(x))
+  (x * (N - 1) + 0.5) / N
+}
+
+print_lrt <- function(m0, m1, label = "") {
+  cat("\n---", label, "---\n")
+  print(anova(m0, m1))
+}
+
+fmt_p <- function(p) ifelse(is.na(p), NA, ifelse(p < .001, "< .001", sprintf("%.3f", p)))
+
+# ==============================================================================
+# 1) Load + prep base data
+# ==============================================================================
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+
+d <- read_csv(infile, show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,   # initial estimate
+    X  = agent_feedback,                # advice
+    R2 = slider_response2_2.response,   # revised estimate
+    s  = s                              # SIU
+  ) %>%
+  mutate(
+    participant     = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present", "Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High", "Medium", "Low")),
+    Advice          = factor(str_to_lower(feedback_type),   levels = c("under", "over"),
+                             labels = c("Under", "Over")),
+    
+    # Advice distance
+    A    = X - R1,
+    absA = abs(A),
+    
+    # Confidence strength on 0–1
+    conf_strength = pmin(pmax(abs(R1) / 100, 0), 1)
+  ) %>%
+  filter(is.finite(s)) %>%
+  group_by(participant) %>%
+  mutate(
+    conf_mean_id = mean(conf_strength, na.rm = TRUE),
+    conf_WP      = conf_strength - conf_mean_id,  # within-person deviation
+    conf_BP      = conf_mean_id                   # between-person mean confidence
+  ) %>%
+  ungroup() %>%
+  mutate(
+    absA_z    = as.numeric(scale(absA)),
+    conf_BP_z = as.numeric(scale(conf_BP)),
+    conf_WP_z = as.numeric(scale(conf_WP))
+  )
+
+# Smithson–Verkuilen squeeze for DV into (0,1)
+d <- d %>% mutate(s_sv = sv_squeeze(s))
+
+# Sum-to-zero contrasts for Type III tests
+contrasts(d$Advice)          <- contr.sum(2)
+contrasts(d$Directed_Motion) <- contr.sum(2)
+contrasts(d$Synchrony)       <- contr.sum(3)
+
+# ==============================================================================
+# 2) ANALYSIS 1: Structural model (Advice × Directed Motion × Synchrony)
+# ==============================================================================
+
+cat("\n====================\nANALYSIS 1: Structural SIU model\n====================\n")
+
+# Baseline (no advice)
+m_noAdvice <- glmmTMB(
+  s_sv ~ absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Advice only (no stimulus)
+m_noStim <- update(m_noAdvice, . ~ . + Advice)
+
+# Add stimulus main + interaction (DM * Synchrony)
+m_addStim <- glmmTMB(
+  s_sv ~ Advice + Directed_Motion * Synchrony + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Full structural model
+m_full <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Block tests (nested LRTs)
+print_lrt(m_noAdvice, m_noStim,  "LRT: Add Advice (baseline -> Advice-only)")
+print_lrt(m_noStim,   m_addStim, "LRT: Add Stimulus block (DM, Synch, DM×Synch)")
+print_lrt(m_addStim,  m_full,    "LRT: Add Advice×Stimulus interaction block")
+
+# Type III Wald χ² tests (full model)
+cat("\n--- Type III Wald χ² tests (Structural full model) ---\n")
+print(car::Anova(m_full, type = "III"))
+
+# Optional: LRT for 3-way only
+m_no3 <- update(m_full, . ~ . - Advice:Directed_Motion:Synchrony)
+print_lrt(m_no3, m_full, "LRT: 3-way Advice×DM×Synchrony")
+
+# ------------------------------------------------------------------------------
+# EMMs + simple effects for Structural model (match your supplement tables)
+# ------------------------------------------------------------------------------
+
+# Hold covariate at mean (absA_z = 0)
+at_struct <- list(absA_z = 0)
+
+# Full cell means (Advice × DM × Synchrony)
+emm_full_cells <- emmeans(
+  m_full, ~ Advice * Directed_Motion * Synchrony,
+  at = at_struct,
+  type = "response"
+)
+
+# Simple effects (within each cell family)
+# Advice within DM×Synchrony
+se_advice_by_cell <- pairs(emm_full_cells, by = c("Directed_Motion", "Synchrony"), adjust = "holm")
+
+# Synchrony within Advice×DM
+se_syn_by_adv_dm <- pairs(emm_full_cells, by = c("Advice", "Directed_Motion"), adjust = "tukey")
+
+# DM within Advice×Synchrony
+se_dm_by_adv_syn <- pairs(emm_full_cells, by = c("Advice", "Synchrony"), adjust = "holm")
+
+cat("\n--- EMMs: Advice×DM×Synchrony (Structural) ---\n")
+print(emm_full_cells)
+
+cat("\n--- Simple effects: Advice within each DM×Synchrony (Structural) ---\n")
+print(se_advice_by_cell)
+
+cat("\n--- Simple effects: Synchrony within each Advice×DM (Structural) ---\n")
+print(se_syn_by_adv_dm)
+
+cat("\n--- Simple effects: Directed Motion within each Advice×Synchrony (Structural) ---\n")
+print(se_dm_by_adv_syn)
+
+# Collapsed (averaged equally over the other factor) “mirror” contrasts + EMMs
+# These correspond to the “mirror analysis” tables you asked for.
+
+# Helper: differences on response scale (ΔSIU) rather than odds ratios
+diff_resp_holm <- function(emm_obj, by_vars) {
+  contrast(
+    regrid(emm_obj, transform = "response"),
+    method = "revpairwise",
+    by = by_vars,
+    adjust = "holm"
+  )
+}
+
+# A) Advice effect within Directed Motion (collapsed over Synchrony)
+emm_adv_by_dm <- emmeans(
+  m_full, ~ Advice | Directed_Motion,
+  at = at_struct,
+  weights = "equal"
+)
+se_adv_by_dm <- diff_resp_holm(emm_adv_by_dm, by_vars = "Directed_Motion")
+
+# B) Directed Motion effect within Advice (collapsed over Synchrony)
+emm_dm_by_adv <- emmeans(
+  m_full, ~ Directed_Motion | Advice,
+  at = at_struct,
+  weights = "equal"
+)
+se_dm_by_adv <- diff_resp_holm(emm_dm_by_adv, by_vars = "Advice")
+
+# C) Advice effect within Synchrony (collapsed over Directed Motion)
+emm_adv_by_syn <- emmeans(
+  m_full, ~ Advice | Synchrony,
+  at = at_struct,
+  weights = "equal"
+)
+se_adv_by_syn <- diff_resp_holm(emm_adv_by_syn, by_vars = "Synchrony")
+
+# D) Synchrony pairwise within Advice (collapsed over Directed Motion) — Tukey
+emm_syn_by_adv <- emmeans(
+  m_full, ~ Synchrony | Advice,
+  at = at_struct,
+  weights = "equal"
+)
+se_syn_by_adv <- pairs(regrid(emm_syn_by_adv, transform = "response"), adjust = "tukey")
+
+# Collapsed EMMs for supplement (Advice×DM; Advice×Synchrony)
+emm_adv_dm_collapsed <- emmeans(
+  m_full, ~ Advice * Directed_Motion,
+  at = at_struct,
+  weights = "equal",
+  type = "response"
+)
+
+emm_adv_syn_collapsed <- emmeans(
+  m_full, ~ Advice * Synchrony,
+  at = at_struct,
+  weights = "equal",
+  type = "response"
+)
+
+cat("\n--- Mirror contrasts: Advice within Directed Motion (ΔSIU; collapsed over Synchrony) ---\n")
+print(se_adv_by_dm)
+
+cat("\n--- Mirror contrasts: Directed Motion within Advice (ΔSIU; collapsed over Synchrony) ---\n")
+print(se_dm_by_adv)
+
+cat("\n--- Mirror contrasts: Advice within Synchrony (ΔSIU; collapsed over Directed Motion) ---\n")
+print(se_adv_by_syn)
+
+cat("\n--- Synchrony within Advice (ΔSIU; Tukey; collapsed over Directed Motion) ---\n")
+print(se_syn_by_adv)
+
+cat("\n--- EMMs: Advice×Directed Motion (collapsed over Synchrony) ---\n")
+print(emm_adv_dm_collapsed)
+
+cat("\n--- EMMs: Advice×Synchrony (collapsed over Directed Motion) ---\n")
+print(emm_adv_syn_collapsed)
+
+# ==============================================================================
+# 3) ANALYSIS 2: Confidence moderation (within–between decomposition)
+#    Branch tests: conf_WP_z × Advice × Directed Motion vs conf_WP_z × Advice × Synchrony
+# ==============================================================================
+
+cat("\n====================\nANALYSIS 2: Confidence moderation\n====================\n")
+
+# Baseline (structural) + covariates + BP confidence
+m_base <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA_z + conf_BP_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Full moderation: add both branches
+m_fullmod <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP_z * Advice * Directed_Motion +
+    conf_WP_z * Advice * Synchrony +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# A-only: conf_WP_z × Advice × DM
+m_Aonly <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP_z * Advice * Directed_Motion +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# B-only: conf_WP_z × Advice × Synchrony
+m_Bonly <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP_z * Advice * Synchrony +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Model comparisons
+print_lrt(m_base,  m_fullmod, "LRT: Baseline vs FULL moderation (A + B)")
+print_lrt(m_Aonly, m_fullmod, "LRT: Is Branch B needed beyond A? (A-only vs Full)")
+print_lrt(m_Bonly, m_fullmod, "LRT: Is Branch A needed beyond B? (B-only vs Full)")
+
+p_overall <- anova(m_base,  m_fullmod)$`Pr(>Chisq)`[2]
+p_needB   <- anova(m_Aonly, m_fullmod)$`Pr(>Chisq)`[2]
+p_needA   <- anova(m_Bonly, m_fullmod)$`Pr(>Chisq)`[2]
+
+cat("\n--- Key p-values ---\n")
+cat("Overall moderation (Base -> Full): p =", signif(p_overall, 4), "\n")
+cat("Need Branch B given A (A-only -> Full): p =", signif(p_needB, 4), "\n")
+cat("Need Branch A given B (B-only -> Full): p =", signif(p_needA, 4), "\n")
+
+# Choose target model (transparent rule)
+alpha <- 0.05
+
+if (!is.na(p_needA) && p_needA < alpha && !is.na(p_needB) && p_needB < alpha) {
+  cat("\n>>> TARGET = FULL moderation (A + B)\n")
+  m_target <- m_fullmod
+} else if (!is.na(p_needA) && p_needA < alpha && (is.na(p_needB) || p_needB >= alpha)) {
+  cat("\n>>> TARGET = A-only moderation (conf_WP_z × Advice × Directed Motion)\n")
+  m_target <- m_Aonly
+} else if (!is.na(p_needB) && p_needB < alpha && (is.na(p_needA) || p_needA >= alpha)) {
+  cat("\n>>> TARGET = B-only moderation (conf_WP_z × Advice × Synchrony)\n")
+  m_target <- m_Bonly
+} else {
+  cat("\n>>> TARGET = Baseline (no supported moderation branch)\n")
+  m_target <- m_base
+}
+
+# Inference on TARGET model
+cat("\n--- Type III Wald χ² tests (TARGET) ---\n")
+print(car::Anova(m_target, type = "III"))
+
+cat("\n--- Fixed effects (TARGET; logit scale) ---\n")
+print(summary(m_target))
+
+# ==============================================================================
+# 4) Probing / EMM tables for TARGET model (only if conf_WP_z is present)
+# ==============================================================================
+
+coef_names <- names(fixef(m_target)$cond)
+has_confWP <- any(grepl("conf_WP_z", coef_names))
+
+if (!has_confWP) {
+  cat("\n(No within-person confidence term in TARGET -> skipping confidence probing.)\n")
+} else {
+  
+  # Confidence levels: -1 SD, mean, +1 SD on z-scale
+  conf_levels <- c(low = -1, mean = 0, high = 1)
+  
+  # Hold covariates at mean
+  at_cov <- list(absA_z = 0, conf_BP_z = 0)
+  
+  # Contrast direction definitions
+  # Advice: Over - Under (levels are Under, Over)
+  c_over_under <- list("Over - Under" = c(-1, 1))
+  # Directed Motion: Absent - Present (levels are Present, Absent)
+  c_abs_pres <- list("Absent - Present" = c(-1, 1))
+  
+  # ---------------------------
+  # (A) EMMs for Figure 4: Advice × Directed Motion at each confidence level
+  # ---------------------------
+  em_fig4 <- emmeans(
+    m_target,
+    ~ Advice * Directed_Motion | conf_WP_z,
+    at = c(list(conf_WP_z = conf_levels), at_cov),
+    type = "response",
+    weights = "equal"  # equal averaging over Synchrony
+  )
+  cat("\n--- EMMs (Figure 4 style): Advice×Directed Motion by confidence (avg over Synchrony) ---\n")
+  print(em_fig4)
+  
+  # ---------------------------
+  # (B) Simple effects: Advice within Directed Motion at each confidence level
+  #     (Over - Under)
+  # ---------------------------
+  em_adv_byDM <- emmeans(
+    m_target,
+    ~ Advice | Directed_Motion * conf_WP_z,
+    at = c(list(conf_WP_z = conf_levels), at_cov),
+    type = "response",
+    weights = "equal"
+  )
+  
+  se_adv_byDM <- contrast(
+    regrid(em_adv_byDM, transform = "response"),
+    method = c_over_under,
+    by = c("Directed_Motion", "conf_WP_z")
+  )
+  
+  cat("\n--- Simple effects: Advice (Over-Under) within Directed Motion × Confidence (ΔSIU) ---\n")
+  print(summary(se_adv_byDM, infer = TRUE))
+  
+  # ---------------------------
+  # (C) Simple effects: Directed Motion within Advice at each confidence level
+  #     (Absent - Present)
+  # ---------------------------
+  em_DM_byAdv <- emmeans(
+    m_target,
+    ~ Directed_Motion | Advice * conf_WP_z,
+    at = c(list(conf_WP_z = conf_levels), at_cov),
+    type = "response",
+    weights = "equal"
+  )
+  
+  se_DM_byAdv <- contrast(
+    regrid(em_DM_byAdv, transform = "response"),
+    method = c_abs_pres,
+    by = c("Advice", "conf_WP_z")
+  )
+  
+  cat("\n--- Simple effects: Directed Motion (Absent-Present) within Advice × Confidence (ΔSIU) ---\n")
+  print(summary(se_DM_byAdv, infer = TRUE))
+  
+  # ---------------------------
+  # (D) Simple slopes of within-person confidence within each Advice × DM cell
+  #     (model/logit scale)
+  # ---------------------------
+  em_conf <- emtrends(
+    m_target,
+    ~ Advice * Directed_Motion,
+    var = "conf_WP_z",
+    at = at_cov
+  )
+  
+  cat("\n--- Simple slopes: effect of conf_WP_z within each Advice × Directed Motion cell (logit scale) ---\n")
+  print(em_conf)
+  
+  cat("\n--- Differences in confidence slopes: Advice effect on slope (within Directed Motion) ---\n")
+  print(pairs(em_conf, by = "Directed_Motion"))
+  
+  cat("\n--- Differences in confidence slopes: Directed Motion effect on slope (within Advice) ---\n")
+  print(pairs(em_conf, by = "Advice"))
+  
+  # ---------------------------
+  # (E) Optional: EMMs collapsed (Advice×DM) at each confidence level
+  #     (Useful if you want a supplement table that mirrors your structural EMMs)
+  # ---------------------------
+  em_adv_dm_by_conf <- emmeans(
+    m_target,
+    ~ Advice * Directed_Motion | conf_WP_z,
+    at = c(list(conf_WP_z = conf_levels), at_cov),
+    type = "response",
+    weights = "equal"
+  )
+  cat("\n--- EMMs: Advice×Directed Motion at each confidence level (avg over Synchrony) ---\n")
+  print(em_adv_dm_by_conf)
+}
+
+# ==============================================================================
+# 5) Sanity check: advice distance distribution
+# ==============================================================================
+
+cat("\n====================\nSanity checks\n====================\n")
+cat("\n--- absA distribution ---\n")
+print(summary(d$absA))
+print(quantile(d$absA, probs = seq(0, 1, .1), na.rm = TRUE))
+
+cat("\n--- Scale checks (R1, X, R2 ranges) ---\n")
+print(
+  d %>%
+    summarise(
+      R1_min = min(R1, na.rm = TRUE),
+      R1_max = max(R1, na.rm = TRUE),
+      X_min  = min(X,  na.rm = TRUE),
+      X_max  = max(X,  na.rm = TRUE),
+      R2_min = min(R2, na.rm = TRUE),
+      R2_max = max(R2, na.rm = TRUE)
+    )
+)
+
+cat("\n=== Script complete. ===\n")
+
+# ------------------------------------------------------------------------------
+# Selection
+# ------------------------------------------------------------------------------
+  
+# ------------------------------------------------------------------------------
+# 0) Data prep (same decomposition, but DV = SIU_zero)
+# ------------------------------------------------------------------------------
+
+d0 <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,
+    X  = agent_feedback,
+    R2 = slider_response2_2.response,
+    s  = s
+  ) %>%
+  mutate(
+    participant     = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present","Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High","Medium","Low")),
+    Advice          = factor(str_to_lower(feedback_type),
+                             levels = c("under","over"),
+                             labels = c("Under","Over")),
+    A    = X - R1,
+    absA = abs(A),
+    
+    # your confidence proxy (keep as you used it)
+    conf_strength = pmin(pmax(abs(R1) / 100, 0), 1),
+    
+    # DV: 1 = ignored (s==0), 0 = used (s>0)
+    SIU_zero = as.integer(s == 0)
+  ) %>%
+  group_by(participant) %>%
+  mutate(
+    conf_mean_id = mean(conf_strength, na.rm = TRUE),
+    conf_WP      = conf_strength - conf_mean_id,
+    conf_BP      = conf_mean_id
+  ) %>%
+  ungroup() %>%
+  mutate(
+    absA_z    = as.numeric(scale(absA)),
+    conf_BP_z = as.numeric(scale(conf_BP))
+  ) %>%
+  filter(is.finite(SIU_zero), is.finite(absA_z), is.finite(conf_WP), is.finite(conf_BP_z))
+
+# Sum-to-zero contrasts (Type III)
+contrasts(d0$Advice)          <- contr.sum(2)
+contrasts(d0$Directed_Motion) <- contr.sum(2)
+contrasts(d0$Synchrony)       <- contr.sum(3)
+
+print_lrt <- function(m0, m1, label) {
+  cat("\n---", label, "---\n")
+  print(anova(m0, m1))
+}
+
+# ------------------------------------------------------------------------------
+# 1) Baseline model (no within-person confidence moderation)
+# ------------------------------------------------------------------------------
+
+m0_base <- glmmTMB(
+  SIU_zero ~ Advice * Directed_Motion * Synchrony + absA_z + conf_BP_z + (1 | participant),
+  family = binomial(link = "logit"),
+  data = d0
+)
+
+# ------------------------------------------------------------------------------
+# 2) Moderation models (same branching logic)
+# ------------------------------------------------------------------------------
+
+m0_fullmod <- glmmTMB(
+  SIU_zero ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Directed_Motion +
+    conf_WP * Advice * Synchrony +
+    (1 | participant),
+  family = binomial(link = "logit"),
+  data = d0
+)
+
+m0_Aonly <- glmmTMB(
+  SIU_zero ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Directed_Motion +
+    (1 | participant),
+  family = binomial(link = "logit"),
+  data = d0
+)
+
+m0_Bonly <- glmmTMB(
+  SIU_zero ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Synchrony +
+    (1 | participant),
+  family = binomial(link = "logit"),
+  data = d0
+)
+
+# ------------------------------------------------------------------------------
+# 3) Model comparisons (LRTs)
+# ------------------------------------------------------------------------------
+
+print_lrt(m0_base,  m0_fullmod, "LRT: baseline vs FULL moderation (A + B)")
+print_lrt(m0_Aonly, m0_fullmod, "LRT: Is Branch B needed?  (A-only vs Full)")
+print_lrt(m0_Bonly, m0_fullmod, "LRT: Is Branch A needed?  (B-only vs Full)")
+
+p_overall <- anova(m0_base,  m0_fullmod)$`Pr(>Chisq)`[2]
+p_needB   <- anova(m0_Aonly, m0_fullmod)$`Pr(>Chisq)`[2]
+p_needA   <- anova(m0_Bonly, m0_fullmod)$`Pr(>Chisq)`[2]
+
+cat("\n--- Key p-values ---\n")
+cat("Overall moderation (Base -> Full): p =", signif(p_overall, 4), "\n")
+cat("Need Branch B given A (A-only -> Full): p =", signif(p_needB, 4), "\n")
+cat("Need Branch A given B (B-only -> Full): p =", signif(p_needA, 4), "\n")
+
+# ------------------------------------------------------------------------------
+# 4) Select TARGET model (same transparent rule)
+# ------------------------------------------------------------------------------
+
+alpha <- 0.05
+
+if (!is.na(p_needA) && p_needA < alpha && !is.na(p_needB) && p_needB < alpha) {
+  cat("\n>>> TARGET = FULL moderation (A + B)\n")
+  m0_target <- m0_fullmod
+} else if (!is.na(p_needA) && p_needA < alpha && (is.na(p_needB) || p_needB >= alpha)) {
+  cat("\n>>> TARGET = A-only moderation (conf_WP × Advice × Directed Motion)\n")
+  m0_target <- m0_Aonly
+} else if (!is.na(p_needB) && p_needB < alpha && (is.na(p_needA) || p_needA >= alpha)) {
+  cat("\n>>> TARGET = B-only moderation (conf_WP × Advice × Synchrony)\n")
+  m0_target <- m0_Bonly
+} else {
+  cat("\n>>> TARGET = Baseline (no supported moderation branch)\n")
+  m0_target <- m0_base
+}
+
+# ------------------------------------------------------------------------------
+# 5) Inference on TARGET model
+# ------------------------------------------------------------------------------
+
+cat("\n--- Type III Wald tests (TARGET) ---\n")
+print(car::Anova(m0_target, type = "III"))
+
+cat("\n--- Fixed effects (TARGET; logit scale) ---\n")
+print(summary(m0_target))
+
+# ------------------------------------------------------------------------------
+# 6) Probing (only if TARGET contains conf_WP)
+# ------------------------------------------------------------------------------
+
+coef_names <- names(fixef(m0_target)$cond)
+has_confWP <- any(grepl("\\bconf_WP\\b", coef_names))
+
+if (!has_confWP) {
+  cat("\n(No conf_WP in TARGET → skipping confidence probing.)\n")
+} else {
+  
+  sd_confWP   <- sd(d0$conf_WP, na.rm = TRUE)
+  conf_levels <- c(low = -sd_confWP, mean = 0, high = sd_confWP)
+  at_cov <- list(absA_z = 0, conf_BP_z = 0)
+  
+  # --------------------------------------------------------------------------
+  # A) Predicted probabilities (descriptives; response scale)
+  # --------------------------------------------------------------------------
+  
+  em_adv_prob <- emmeans(
+    m0_target, ~ Advice | conf_WP,
+    at = c(list(conf_WP = conf_levels), at_cov),
+    type = "response",
+    weights = "equal"
+  )
+  
+  cat("\n--- Predicted P(SIU=0) by Advice at each confidence level ---\n")
+  print(em_adv_prob)
+  
+  # --------------------------------------------------------------------------
+  # B) Advice contrasts within DM × confidence (INFERENCE; link/logit scale)
+  #    -> gives beta (log-odds), SE, z, p, and link-scale CIs
+  # --------------------------------------------------------------------------
+  
+  em_adv_byDM_link <- emmeans(
+    m0_target,
+    ~ Advice | Directed_Motion * conf_WP,
+    at = c(list(conf_WP = conf_levels), at_cov),
+    type = "link",        # IMPORTANT: logit scale
+    weights = "equal"
+  )
+  
+  cat("\n--- EMMs (logit): Advice within Directed Motion at each conf_WP ---\n")
+  print(em_adv_byDM_link)
+  
+  cat("\n--- Advice contrast (Under − Over) within Directed Motion at each conf_WP (beta/logit) ---\n")
+  adv_contr_byDM <- pairs(
+    em_adv_byDM_link,
+    by = c("Directed_Motion", "conf_WP"),
+    adjust = "none"
+  )
+  print(adv_contr_byDM)
+  
+  cat("\n--- Advice contrast with 95% CIs (beta/logit) ---\n")
+  print(confint(adv_contr_byDM, level = 0.95))
+  
+  # --------------------------------------------------------------------------
+  # C) NEW: Directed Motion contrasts within Advice × confidence (INFERENCE; link/logit scale)
+  #    -> this is what you were missing for the DM simple effects section
+  # --------------------------------------------------------------------------
+  
+  em_dm_byAdv_link <- emmeans(
+    m0_target,
+    ~ Directed_Motion | Advice * conf_WP,
+    at = c(list(conf_WP = conf_levels), at_cov),
+    type = "link",        # IMPORTANT: logit scale
+    weights = "equal"
+  )
+  
+  cat("\n--- EMMs (logit): Directed Motion within Advice at each conf_WP ---\n")
+  print(em_dm_byAdv_link)
+  
+  cat("\n--- Directed Motion contrast (Present − Absent) within Advice at each conf_WP (beta/logit) ---\n")
+  dm_contr_byAdv <- pairs(
+    em_dm_byAdv_link,
+    by = c("Advice", "conf_WP"),
+    adjust = "none"
+  )
+  print(dm_contr_byAdv)
+  
+  cat("\n--- Directed Motion contrast with 95% CIs (beta/logit) ---\n")
+  print(confint(dm_contr_byAdv, level = 0.95))
+}
+
+# ------------------------------------------------------------------------------
+# Weighting
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Helper: neat LRT printing
+# ------------------------------------------------------------------------------
+print_lrt <- function(m0, m1, label) {
+  cat("\n---", label, "---\n")
+  print(anova(m0, m1))
+}
+
+# ------------------------------------------------------------------------------
+# 0) Data prep
+# ------------------------------------------------------------------------------
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+
+d <- read_csv(infile, show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,
+    X  = agent_feedback,
+    R2 = slider_response2_2.response,
+    s  = s
+  ) %>%
+  mutate(
+    participant     = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present","Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High","Medium","Low")),
+    Advice          = factor(str_to_lower(feedback_type),
+                             levels = c("under","over"),
+                             labels = c("Under","Over")),
+    A    = X - R1,
+    absA = abs(A),
+    
+    # Your confidence proxy (as used previously)
+    conf_strength = pmin(pmax(abs(R1) / 100, 0), 1)
+  ) %>%
+  group_by(participant) %>%
+  mutate(
+    conf_mean_id = mean(conf_strength, na.rm = TRUE),
+    conf_WP      = conf_strength - conf_mean_id,   # within-person deviation
+    conf_BP      = conf_mean_id                    # between-person mean confidence
+  ) %>%
+  ungroup() %>%
+  mutate(
+    absA_z    = as.numeric(scale(absA)),
+    conf_BP_z = as.numeric(scale(conf_BP))
+  ) %>%
+  filter(is.finite(s), is.finite(absA_z), is.finite(conf_WP), is.finite(conf_BP_z))
+
+# ------------------------------------------------------------------------------
+# 0b) Restrict DV to partial advice use: 0 < s < 1
+# ------------------------------------------------------------------------------
+d_partial <- d %>%
+  filter(s > 0, s <= 1)
+
+cat("\n--- Partial-use sample size ---\n")
+cat("n rows (trials) =", nrow(d_partial), "\n")
+cat("n participants  =", n_distinct(d_partial$participant), "\n")
+
+stopifnot(nrow(d_partial) > 0)
+
+# Smithson–Verkuilen squeeze for beta regression (after filtering)
+N <- nrow(d_partial)
+d_partial <- d_partial %>%
+  mutate(
+    s_sv = (s * (N - 1) + 0.5) / N
+  )
+
+# ------------------------------------------------------------------------------
+# Contrasts for Type III tests
+# ------------------------------------------------------------------------------
+contrasts(d_partial$Advice)          <- contr.sum(2)
+contrasts(d_partial$Directed_Motion) <- contr.sum(2)
+contrasts(d_partial$Synchrony)       <- contr.sum(3)
+
+# ------------------------------------------------------------------------------
+# 1) Baseline model (no within-person confidence moderation)
+# ------------------------------------------------------------------------------
+m_base <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA_z + conf_BP_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_partial
+)
+
+# ------------------------------------------------------------------------------
+# 2) Moderation models (A, B, Full)
+# ------------------------------------------------------------------------------
+m_fullmod <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Directed_Motion +
+    conf_WP * Advice * Synchrony +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_partial
+)
+
+m_Aonly <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Directed_Motion +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_partial
+)
+
+m_Bonly <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony +
+    absA_z + conf_BP_z +
+    conf_WP * Advice * Synchrony +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_partial
+)
+
+# ------------------------------------------------------------------------------
+# 3) Model comparisons
+# ------------------------------------------------------------------------------
+print_lrt(m_base,  m_fullmod, "LRT: baseline vs FULL moderation (A + B)")
+print_lrt(m_Aonly, m_fullmod, "LRT: Is Branch B needed?  (A-only vs Full)")
+print_lrt(m_Bonly, m_fullmod, "LRT: Is Branch A needed?  (B-only vs Full)")
+
+p_overall <- anova(m_base,  m_fullmod)$`Pr(>Chisq)`[2]
+p_needB   <- anova(m_Aonly, m_fullmod)$`Pr(>Chisq)`[2]  # adding B
+p_needA   <- anova(m_Bonly, m_fullmod)$`Pr(>Chisq)`[2]  # adding A
+
+cat("\n--- Key p-values ---\n")
+cat("Overall moderation (Base -> Full): p =", signif(p_overall, 4), "\n")
+cat("Need Branch B given A (A-only -> Full): p =", signif(p_needB, 4), "\n")
+cat("Need Branch A given B (B-only -> Full): p =", signif(p_needA, 4), "\n")
+
+# ------------------------------------------------------------------------------
+# 4) Choose TARGET model (transparent rule)
+# ------------------------------------------------------------------------------
+alpha <- 0.05
+
+if (!is.na(p_needA) && p_needA < alpha && !is.na(p_needB) && p_needB < alpha) {
+  cat("\n>>> TARGET = FULL moderation (A + B)\n")
+  m_target <- m_fullmod
+} else if (!is.na(p_needA) && p_needA < alpha && (is.na(p_needB) || p_needB >= alpha)) {
+  cat("\n>>> TARGET = A-only moderation (conf_WP × Advice × Directed Motion)\n")
+  m_target <- m_Aonly
+} else if (!is.na(p_needB) && p_needB < alpha && (is.na(p_needA) || p_needA >= alpha)) {
+  cat("\n>>> TARGET = B-only moderation (conf_WP × Advice × Synchrony)\n")
+  m_target <- m_Bonly
+} else {
+  cat("\n>>> TARGET = Baseline (no supported moderation branch)\n")
+  m_target <- m_base
+}
+
+# ------------------------------------------------------------------------------
+# 5) Inference on TARGET model
+# ------------------------------------------------------------------------------
+cat("\n--- Type III Wald tests (TARGET) ---\n")
+print(car::Anova(m_target, type = "III"))
+
+cat("\n--- Fixed effects (TARGET; logit scale) ---\n")
+print(summary(m_target))
+
+# ------------------------------------------------------------------------------
+# 6) Probing simple effects for TARGET model (no confidence moderation retained)
+# ------------------------------------------------------------------------------
+
+at_cov <- list(absA_z = 0, conf_BP_z = 0)
+
+# ------------------------------------------------------------------------------
+# A) Advice × Directed Motion
+# ------------------------------------------------------------------------------
+
+# Advice within Directed Motion (logit scale)
+em_adv_byDM_link <- emmeans(
+  m_target,
+  ~ Advice | Directed_Motion,
+  at = at_cov,
+  type = "link",
+  weights = "equal"
+)
+
+cat("\n--- Advice within Directed Motion (logit scale) ---\n")
+print(em_adv_byDM_link)
+
+cat("\n--- Advice contrast (Under − Over) within Directed Motion ---\n")
+adv_contr_byDM <- pairs(em_adv_byDM_link, adjust = "none")
+print(adv_contr_byDM)
+
+cat("\n--- Advice contrast with 95% CIs ---\n")
+print(confint(adv_contr_byDM, level = 0.95))
+
+
+# Directed Motion within Advice (logit scale)
+em_DM_byAdv_link <- emmeans(
+  m_target,
+  ~ Directed_Motion | Advice,
+  at = at_cov,
+  type = "link",
+  weights = "equal"
+)
+
+cat("\n--- Directed Motion within Advice (logit scale) ---\n")
+print(em_DM_byAdv_link)
+
+cat("\n--- Directed Motion contrast (Present − Absent) within Advice ---\n")
+dm_contr_byAdv <- pairs(em_DM_byAdv_link, adjust = "none")
+print(dm_contr_byAdv)
+
+cat("\n--- Directed Motion contrast with 95% CIs ---\n")
+print(confint(dm_contr_byAdv, level = 0.95))
+
+
+# ------------------------------------------------------------------------------
+# B) Advice × Synchrony
+# ------------------------------------------------------------------------------
+
+em_adv_bySyn_link <- emmeans(
+  m_target,
+  ~ Advice | Synchrony,
+  at = at_cov,
+  type = "link",
+  weights = "equal"
+)
+
+cat("\n--- Advice within Synchrony (logit scale) ---\n")
+print(em_adv_bySyn_link)
+
+cat("\n--- Advice contrast (Under − Over) within Synchrony ---\n")
+adv_contr_bySyn <- pairs(em_adv_bySyn_link, adjust = "none")
+print(adv_contr_bySyn)
+
+cat("\n--- Advice contrast with 95% CIs ---\n")
+print(confint(adv_contr_bySyn, level = 0.95))
+
+# ------------------------------------------------------------------------------
+# Exploratory: Categorical Switch (Descriptive, no models)
+# ------------------------------------------------------------------------------
+
+d_switch <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE) %>%
+  transmute(
+    participant = factor(participant),
+    R1 = suppressWarnings(as.numeric(slider_response1_2.response)),
+    R2 = suppressWarnings(as.numeric(slider_response2_2.response)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    feedback_type = str_to_lower(feedback_type)
+  ) %>%
+  # keep only real advice (drop random)
+  filter(feedback_type %in% c("under", "over")) %>%
+  mutate(
+    # categorical coding around 0
+    cat_R1 = case_when(R1 > 0 ~ "Yes", R1 < 0 ~ "No", TRUE ~ NA_character_),
+    cat_R2 = case_when(R2 > 0 ~ "Yes", R2 < 0 ~ "No", TRUE ~ NA_character_),
+    cat_X  = case_when(X  > 0 ~ "Yes", X  < 0 ~ "No", TRUE ~ NA_character_),
+    
+    # any categorical switch?
+    switch_any = as.integer(!is.na(cat_R1) & !is.na(cat_R2) & cat_R1 != cat_R2),
+    
+    # is advice categorically opposite to initial judgment?
+    advice_opposite = as.integer(!is.na(cat_R1) & !is.na(cat_X) & cat_R1 != cat_X),
+    
+    # distance measures you wanted
+    absR1 = abs(R1),         # distance of initial response from midpoint
+    absX  = abs(X)           # distance of advice from midpoint
+  ) %>%
+  # keep trials where both R1 and R2 have a category
+  filter(!is.na(cat_R1), !is.na(cat_R2)) %>%
+  droplevels()
+
+
+# -----------------------------
+# 1) Overall flip rate
+# -----------------------------
+overall_flip_rate <- mean(d_switch$switch_any)
+n_flips  <- sum(d_switch$switch_any)
+n_trials <- nrow(d_switch)
+
+cat("\nOverall flip rate:", round(overall_flip_rate, 3),
+    "\nFlips:", n_flips,
+    "\nTotal trials:", n_trials, "\n")
+
+
+# -----------------------------
+# 2) Directional switches (conflict trials only)
+# -----------------------------
+d_conflict_dir <- d_switch %>%
+  filter(advice_opposite == 1) %>%
+  mutate(
+    switch_direction = case_when(
+      cat_R1 == "No"  & cat_R2 == "Yes" ~ "No_to_Yes",
+      cat_R1 == "Yes" & cat_R2 == "No"  ~ "Yes_to_No",
+      TRUE ~ "No_Switch"
+    )
+  )
+
+direction_counts <- d_conflict_dir %>% count(switch_direction)
+print(direction_counts)
+
+n_no_to_yes <- sum(d_conflict_dir$switch_direction == "No_to_Yes")
+n_yes_to_no <- sum(d_conflict_dir$switch_direction == "Yes_to_No")
+n_total_switches <- n_no_to_yes + n_yes_to_no
+
+cat("\nNo→Yes:", n_no_to_yes,
+    "\nYes→No:", n_yes_to_no,
+    "\nTotal directional switches:", n_total_switches, "\n")
+
+if (n_total_switches > 0) {
+  cat("\nBinomial test (50/50 split among switchers):\n")
+  print(binom.test(n_no_to_yes, n_total_switches, p = 0.5))
+}
+
+
+# -----------------------------
+# 3) Conditional switch rates (given conflict)
+# -----------------------------
+conditional_rates <- d_conflict_dir %>%
+  group_by(cat_R1) %>%
+  summarise(
+    n_trials = n(),
+    n_switch = sum(switch_any),
+    switch_rate = mean(switch_any),
+    .groups = "drop"
+  )
+
+print(conditional_rates)
+
+n_no_trials  <- conditional_rates$n_trials[conditional_rates$cat_R1 == "No"]
+n_yes_trials <- conditional_rates$n_trials[conditional_rates$cat_R1 == "Yes"]
+n_no_switch  <- conditional_rates$n_switch[conditional_rates$cat_R1 == "No"]
+n_yes_switch <- conditional_rates$n_switch[conditional_rates$cat_R1 == "Yes"]
+
+cat("\nTwo-proportion test (conditional switch rates):\n")
+print(prop.test(
+  x = c(n_no_switch, n_yes_switch),
+  n = c(n_no_trials, n_yes_trials)
+))
+
+
+# -----------------------------
+# 4) Distance descriptives (conflict trials)
+# -----------------------------
+dist_summary <- d_conflict_dir %>%
+  mutate(switched = if_else(switch_any == 1, "Switch", "No_Switch")) %>%
+  group_by(cat_R1, switched) %>%
+  summarise(
+    n = n(),
+    mean_absX = mean(absX, na.rm = TRUE),
+    sd_absX   = sd(absX, na.rm = TRUE),
+    mean_absR1 = mean(absR1, na.rm = TRUE),
+    sd_absR1   = sd(absR1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nDistance summary (conflict trials):\n")
+print(dist_summary)
