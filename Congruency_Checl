@@ -1,0 +1,2036 @@
+# ------------------------------------------------------------------------------
+# Congruency Check
+# Advice x Synchrony x Directed X Confidence X Binary Choice
+# ------------------------------------------------------------------------------
+
+# ============================================================
+# Social Information Use (SIU) — Full Analysis Script
+# - Data loading, preprocessing
+# - Congruency tests (without confidence, composition checks)
+# - Confidence-moderated model & Synchrony drop test
+# - Simple effects from reduced final model
+# - Congruency added to confidence model on the SAME dataset
+# ============================================================
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+
+# ---- Load & prepare base data 'd' (used for confidence models) ----
+d <- read_csv(infile, show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,   # initial estimate
+    X  = agent_feedback,                # advice value
+    R2 = slider_response2_2.response,   # revised estimate
+    s  = s                              # SIU in [0,1] (post-cleaning)
+  ) %>%
+  mutate(
+    participant     = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present","Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High","Medium","Low")),
+    Advice          = factor(str_to_lower(feedback_type),   levels = c("under","over"),
+                             labels = c("Under","Over")),
+    # advice distance
+    A    = X - R1,
+    absA = abs(A),
+    absA_z = as.numeric(scale(absA)),
+    # confidence strength and within-person deviation
+    conf_strength = pmin(pmax(abs(R1) / 100, 0), 1)
+  ) %>%
+  group_by(participant) %>%
+  mutate(conf_mean_id = mean(conf_strength, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(conf_WP = conf_strength - conf_mean_id,
+         conf_WP_z = as.numeric(scale(conf_WP)))
+
+# SV squeeze for SIU on the *full d* (used in models that use d as-is)
+N_all <- nrow(d)
+d <- d %>% mutate(s_sv = (s * (N_all - 1) + 0.5) / N_all)
+
+# effect (sum-to-zero) contrasts
+contrasts(d$Advice)          <- contr.sum(2)
+contrasts(d$Directed_Motion) <- contr.sum(2)
+contrasts(d$Synchrony)       <- contr.sum(3)
+
+# ============================================================
+# PART A — Congruency tests WITHOUT confidence
+# ============================================================
+
+# Build d2 with Congruent (requires binning R1 into yes/no; drops R1==0)
+d2 <- d %>%
+  mutate(
+    R1_bin     = case_when(R1 > 0 ~ +1L, R1 < 0 ~ -1L, TRUE ~ NA_integer_),
+    Advice_dir = ifelse(Advice == "Over", +1L, -1L),
+    Congruent  = as.integer(Advice_dir == R1_bin)
+  ) %>%
+  filter(!is.na(R1_bin)) %>%
+  droplevels()
+
+# Recompute SV squeeze on the d2 sample (good practice)
+N_d2 <- nrow(d2)
+d2 <- d2 %>% mutate(s_sv = (s * (N_d2 - 1) + 0.5) / N_d2)
+
+# (Re)set sum-to-zero contrasts (Synchrony optional if unused in the model here)
+contrasts(d2$Advice)          <- contr.sum(2)
+contrasts(d2$Directed_Motion) <- contr.sum(2)
+contrasts(d2$Synchrony)       <- contr.sum(3)
+
+cat("\n=== PART A: Congruency (no confidence) ===\n")
+
+# A1) Baseline: Advice × DM + absA_z + (1|id)
+mA <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d2
+)
+
+# A2) Add Congruent
+mB <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion + Congruent + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d2
+)
+
+# A3) Replace Advice×DM with Congruent×DM
+mC <- glmmTMB(
+  s_sv ~ Congruent * Directed_Motion + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d2
+)
+
+cat("\n-- LRT: mA vs mB (Does Congruent add beyond Advice×DM?) --\n")
+print(anova(mA, mB))
+cat("\n-- Non-nested AIC/BIC orientation: mA vs mC --\n")
+print(anova(mA, mC))
+
+cat("\n-- Type III (mB) --\n"); print(car::Anova(mB, type = "III"))
+cat("\n-- Type III (mC) --\n"); print(car::Anova(mC, type = "III"))
+
+# A4) Does stimulus affect Congruent probability?
+m_cong <- glmer(
+  Congruent ~ Directed_Motion * Synchrony + (1 | participant),
+  family = binomial, data = d2
+)
+cat("\n-- Omnibus on Congruent ~ DM*Synchrony --\n")
+print(car::Anova(m_cong, type = "III"))
+
+emm_cong <- emmeans(m_cong, ~ Directed_Motion | Synchrony, type = "response")
+cat("\n-- EMMs: P(Congruent | DM, Synchrony) --\n")
+print(emm_cong)
+
+# A5) Simple effect: Congruent -> higher SIU (adjusting for |X-R1|)
+m_si_cong <- glmmTMB(
+  s_sv ~ Congruent + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d2
+)
+cat("\n-- Congruent main effect on SIU (beta-GLMM) --\n")
+print(summary(m_si_cong))
+
+# A6) Stratify by R1 polarity (composition vs within-R1)
+d_yes <- d2 %>% filter(R1_bin == +1)
+d_no  <- d2 %>% filter(R1_bin == -1)
+
+m_yes <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_yes
+)
+m_no <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d_no
+)
+
+cat("\n-- Type III within R1 = YES --\n"); print(car::Anova(m_yes, type = "III"))
+cat("\n-- Type III within R1 = NO  --\n"); print(car::Anova(m_no,  type = "III"))
+
+# ============================================================
+# PART B — Confidence-moderated model & Synchrony drop
+# ============================================================
+
+cat("\n=== PART B: Confidence-moderated model & Synchrony drop ===\n")
+
+# B1) Baseline (with Synchrony): Advice * DM * Synchrony + absA_z
+m_base <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA_z + (1 | participant),
+  family = beta_family(link = "logit"), data = d
+)
+
+# B2) Add Advice × DM × conf_WP_z moderator
+m_conf_DM <- glmmTMB(
+  s_sv ~ absA_z +
+    Advice * Directed_Motion * Synchrony +
+    Advice * Directed_Motion * conf_WP_z +
+    (1 | participant),
+  family = beta_family(link = "logit"), data = d
+)
+
+cat("\n-- LRT: Does Advice×DM×Confidence improve over baseline? --\n")
+print(anova(m_base, m_conf_DM))
+
+# (Optional) Advice × Synchrony × Confidence
+m_conf_SYN <- glmmTMB(
+  s_sv ~ absA_z +
+    Advice * Directed_Motion * Synchrony +
+    Advice * Synchrony * conf_WP_z +
+    (1 | participant),
+  family = beta_family(link = "logit"), data = d
+)
+
+cat("\n-- LRT: Does Advice×Synchrony×Confidence improve over baseline? --\n")
+print(anova(m_base, m_conf_SYN))
+
+cat("\n-- Type III (m_conf_DM) --\n")
+print(car::Anova(m_conf_DM, type = "III"))
+
+# B3) Can we drop Synchrony terms from m_conf_DM?
+m_dropSyn_all <- update(
+  m_conf_DM,
+  . ~ . - Synchrony - Advice:Synchrony - Directed_Motion:Synchrony - Advice:Directed_Motion:Synchrony
+)
+cat("\n-- LRT: Drop all Synchrony terms --\n")
+print(anova(m_dropSyn_all, m_conf_DM))
+
+# Keep Synchrony main effect (optional)
+m_dropSyn_int <- update(
+  m_conf_DM,
+  . ~ . - Advice:Synchrony - Directed_Motion:Synchrony - Advice:Directed_Motion:Synchrony
+)
+cat("\n-- LRT: Drop only Synchrony interactions --\n")
+print(anova(m_dropSyn_int, m_conf_DM))
+
+cat("\n-- Type III (reduced, no synchrony terms) --\n")
+print(car::Anova(m_dropSyn_all, type = "III"))
+
+# Final reduced model for simple effects:
+m_final <- m_dropSyn_all
+cat("\n--- Final model used for simple effects: s_sv ~ absA_z + Advice * Directed_Motion * conf_WP_z + (1|id) ---\n")
+
+# ============================================================
+# PART C — Simple effects from the reduced final model
+# ============================================================
+
+fmt_eff <- function(x, digs = 3) {
+  x <- as.data.frame(x)
+  x %>%
+    transmute(
+      contrast,
+      Directed_Motion = if ("Directed_Motion" %in% names(.)) Directed_Motion else NA,
+      Advice          = if ("Advice" %in% names(.)) Advice else NA,
+      conf_WP_z       = if ("conf_WP_z" %in% names(.)) conf_WP_z else NA,
+      Delta = estimate,
+      SE = SE,
+      z  = z.ratio,
+      p  = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value)),
+      LCL = asymp.LCL, UCL = asymp.UCL,
+      ci = sprintf("[%.3f, %.3f]", LCL, UCL)
+    ) %>%
+    mutate(across(c(Delta, SE, z), ~round(.x, digs)))
+}
+
+conf_levels <- c(low = -1, mean = 0, high = +1)
+
+# C1) Advice simple effects within DM at each confidence level
+em_advice_byDM_final <- emmeans(
+  m_final, ~ Advice | Directed_Motion * conf_WP_z,
+  at = list(conf_WP_z = conf_levels, absA_z = 0),
+  type = "response", weights = "equal"
+)
+se_advice_byDM_final <- contrast(
+  regrid(em_advice_byDM_final, transform = "response"),
+  "revpairwise", by = c("Directed_Motion", "conf_WP_z")
+)
+adv_DM_tbl_final <- fmt_eff(summary(se_advice_byDM_final, infer = TRUE))
+cat("\n-- Simple effects: Advice within DM × Confidence (Δ on response) --\n")
+print(adv_DM_tbl_final)
+
+# C2) DM simple effects within Advice at each confidence level
+em_DM_byAdvice_final <- emmeans(
+  m_final, ~ Directed_Motion | Advice * conf_WP_z,
+  at = list(conf_WP_z = conf_levels, absA_z = 0),
+  type = "response", weights = "equal"
+)
+se_DM_byAdvice_final <- contrast(
+  regrid(em_DM_byAdvice_final, transform = "response"),
+  "revpairwise", by = c("Advice", "conf_WP_z")
+)
+dm_adv_tbl_final <- as.data.frame(summary(se_DM_byAdvice_final, infer = TRUE)) %>%
+  transmute(
+    Advice, conf_WP_z, contrast, Delta = estimate, SE = SE, z = z.ratio,
+    p = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value)),
+    LCL = asymp.LCL, UCL = asymp.UCL,
+    ci = sprintf("[%.3f, %.3f]", LCL, UCL)
+  ) %>%
+  mutate(across(c(Delta, SE, z), ~round(.x, 3)))
+cat("\n-- Simple effects: DM within Advice × Confidence (Δ on response) --\n")
+print(dm_adv_tbl_final)
+
+# C3) Simple slopes of confidence (emtrends) within each Advice × DM cell
+em_conf_final <- emtrends(
+  m_final, ~ Advice * Directed_Motion,
+  var = "conf_WP_z", at = list(absA_z = 0)
+)
+cat("\n-- Slope(Confidence) differences: DM by Advice --\n")
+print(pairs(em_conf_final, by = "Advice"))
+cat("\n-- Slope(Confidence) differences: Advice by DM --\n")
+print(pairs(em_conf_final, by = "Directed_Motion"))
+
+# ============================================================
+# PART D — Add Congruent to the confidence model (SAME dataset)
+# ============================================================
+
+cat("\n=== PART D: Congruency added to confidence model (same rows) ===\n")
+
+# Build d_conf with Congruent & drop R1==0 so that LRTs are valid
+d_conf <- d %>%
+  mutate(
+    R1_bin     = ifelse(R1 > 0, +1L, ifelse(R1 < 0, -1L, NA_integer_)),
+    Advice_dir = ifelse(Advice == "Over", +1L, -1L),
+    Congruent  = as.integer(Advice_dir == R1_bin)
+  ) %>%
+  filter(!is.na(R1_bin)) %>%
+  droplevels()
+
+# Recompute SV squeeze on *this* dataset
+N_conf <- nrow(d_conf)
+d_conf <- d_conf %>% mutate(s_sv = (s * (N_conf - 1) + 0.5) / N_conf)
+
+# Ensure absA_z exists (recompute safely) & contrasts
+d_conf <- d_conf %>%
+  mutate(A = X - R1, absA = abs(A), absA_z = as.numeric(scale(absA)))
+contrasts(d_conf$Advice)          <- contr.sum(2)
+contrasts(d_conf$Directed_Motion) <- contr.sum(2)
+
+# D1) Refit the base confidence model on the SAME rows (no Congruent)
+m_base_conf_refit <- glmmTMB(
+  s_sv ~ absA_z + Advice * Directed_Motion * conf_WP_z + (1 | participant),
+  family = beta_family(link = "logit"), data = d_conf
+)
+
+# D2) Add Congruent main effect (nested LRT is valid now)
+m_cong1 <- glmmTMB(
+  s_sv ~ absA_z + Advice * Directed_Motion * conf_WP_z + Congruent + (1 | participant),
+  family = beta_family(link = "logit"), data = d_conf
+)
+
+cat("\n-- LRT: Base (Advice×DM×Conf) vs +Congruent --\n")
+print(anova(m_base_conf_refit, m_cong1))
+cat("\n-- Type III (+Congruent) --\n")
+print(car::Anova(m_cong1, type = "III"))
+
+# D3) Optional: Congruent×DM
+m_cong2 <- update(m_cong1, . ~ . + Congruent:Directed_Motion)
+cat("\n-- LRT: +Congruent×DM --\n")
+print(anova(m_cong1, m_cong2))
+cat("\n-- Type III (Congruent×DM) --\n")
+print(car::Anova(m_cong2, type = "III"))
+
+# D4) Optional: Congruent×Confidence
+m_cong3 <- update(m_cong2, . ~ . + Congruent:conf_WP_z)
+cat("\n-- LRT: +Congruent×Confidence --\n")
+print(anova(m_cong2, m_cong3))
+cat("\n-- Type III (Congruent×Conf) --\n")
+print(car::Anova(m_cong3, type = "III"))
+
+# D5) Optional: Congruent×DM×Confidence
+m_cong4 <- update(m_cong3, . ~ . + Congruent:Directed_Motion:conf_WP_z)
+cat("\n-- LRT: +Congruent×DM×Confidence --\n")
+print(anova(m_cong3, m_cong4))
+cat("\n-- Type III (3-way with Congruent) --\n")
+print(car::Anova(m_cong4, type = "III"))
+
+# Pick the best (by LRT/AIC); suppose m_cong3 was best:
+m_best <- m_cong3
+
+# D6) Does Advice×DM survive after adding Congruent terms?
+m_drop_AdvDM <- update(m_best, . ~ . - Advice:Directed_Motion)
+cat("\n-- LRT: Drop Advice×DM (after Congruent terms) --\n")
+print(anova(m_drop_AdvDM, m_best))
+
+# D7) Does Advice×DM×Confidence survive?
+m_drop_AdvDMConf <- update(m_best, . ~ . - Advice:Directed_Motion:conf_WP_z)
+cat("\n-- LRT: Drop Advice×DM×Confidence (after Congruent terms) --\n")
+print(anova(m_drop_AdvDMConf, m_best))
+
+cat("\n=== Done. ===\n")
+
+
+
+# ------------------------------------------------------------------------------
+# ANALYSIS: SOCIAL INFORMATION USE (SIU)
+# MODEL 2: Advice × Directed Motion × Synchrony × Confidence
+# ------------------------------------------------------------------------------
+
+# Goal:
+# Test whether within-person confidence moderates the extent to which participants
+# use social advice (SIU), above and beyond the effects of stimulus features.
+#
+# DV:
+#   SIU (s) ∈ [0,1]  → modeled with beta mixed-effects regression.
+#
+# Key moderator:
+#   Within-person confidence deviation (conf_WP_z), computed from the absolute
+#   strength of the initial judgment (R1) and person-mean centered.
+#
+# Covariate:
+#   Absolute advice discrepancy absA_z = |X − R1| (z-standardized).
+#
+# Random effects:
+#   Random intercept for participant (accounts for repeated measures).
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Data preparation
+# ------------------------------------------------------------------------------
+
+# Load cleaned, trial-level SIU dataset and harmonize variable names
+d <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE) %>%
+  # Harmonize key variable names across analyses
+  rename(
+    R1 = slider_response1_2.response,  # Initial (pre-advice) estimate
+    X  = agent_feedback,               # Social advice value
+    R2 = slider_response2_2.response,  # Revised (post-advice) estimate
+    s  = s                             # Social information use (SIU), 0–1 scaled
+  ) %>%
+  mutate(
+    # Ensure categorical predictors are properly formatted
+    participant     = factor(participant),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present", "Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High", "Medium", "Low")),
+    Advice          = factor(str_to_lower(feedback_type),   levels = c("under", "over"),
+                             labels = c("Under", "Over")),
+    
+    # Compute advice distance (signed and absolute)
+    A    = X - R1,
+    absA = abs(A),
+    
+    # Compute confidence strength (absolute R1 scaled between 0–1)
+    conf_strength = pmin(pmax(abs(R1) / 100, 0), 1)
+  ) %>%
+  # Compute participant-level mean confidence and within-person deviations
+  group_by(participant) %>%
+  mutate(conf_mean_id = mean(conf_strength, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(conf_WP = conf_strength - conf_mean_id) %>%  # Within-person confidence deviation
+  # Z-standardize continuous covariates
+  mutate(
+    absA_z    = as.numeric(scale(absA)),
+    conf_WP_z = as.numeric(scale(conf_WP))
+  )
+
+# ------------------------------------------------------------------------------
+# Outcome transformation and coding
+# ------------------------------------------------------------------------------
+
+# Beta regression requires DV strictly in (0,1).
+# Apply Smithson–Verkuilen transformation to "squeeze" s away from 0/1 boundaries.
+N <- nrow(d)
+d <- d %>% mutate(s_sv = (s * (N - 1) + 0.5) / N)
+
+# Apply sum-to-zero (effect coding) contrasts for Type III tests
+contrasts(d$Advice)          <- contr.sum(2)
+contrasts(d$Directed_Motion) <- contr.sum(2)
+contrasts(d$Synchrony)       <- contr.sum(3)
+
+# ------------------------------------------------------------------------------
+# Baseline model (no confidence moderation)
+# ------------------------------------------------------------------------------
+# This model corresponds to the main factorial structure:
+# Advice × Directed Motion × Synchrony, controlling for advice magnitude (absA_z).
+
+m_base <- glmmTMB(
+  s_sv ~ Advice * Directed_Motion * Synchrony + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# ------------------------------------------------------------------------------
+# Candidate moderation models (confidence as moderator)
+# ------------------------------------------------------------------------------
+# We test two theoretically plausible moderation "branches":
+#   (1) confidence moderates Advice × Directed Motion
+#   (2) confidence moderates Advice × Synchrony
+#
+# Both models retain the baseline factorial structure to avoid omitted-variable
+# bias when testing confidence interactions.
+
+
+# Model branch 1: confidence moderates Advice × Directed Motion
+m_conf_DM <- glmmTMB(
+  s_sv ~ absA_z +
+    Advice * Directed_Motion * Synchrony +     # Full factorial structure
+    Advice * Directed_Motion * conf_WP_z +     # Confidence moderation
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+# Likelihood-ratio test: Does confidence improve model fit?
+cat("\n--- LRT: Does adding Advice × Directed Motion × Confidence improve fit? ---\n")
+anova(m_base, m_conf_DM)
+
+# Alternative model: Confidence moderates Advice x Synchrony
+
+m_conf_SYN <- glmmTMB(
+  s_sv ~ absA_z +
+    Advice * Directed_Motion * Synchrony +
+    Advice * Synchrony * conf_WP_z +
+    (1 | participant),
+  family = beta_family(link = "logit"),
+  data = d
+)
+
+cat("\n--- LRT: Does adding Advice × Synchrony × Confidence improve fit? ---\n")
+anova(m_base, m_conf_SYN)
+
+# ------------------------------------------------------------------------------
+# Omnibus inference for the preferred model
+# ------------------------------------------------------------------------------
+# Inspect fixed effects using Type III Wald χ² tests (effect coding).
+# Note: This is an omnibus test per term (multi-df terms tested jointly).
+
+cat("\n--- Type III Wald tests (best-fitting model: Advice × Directed Motion × Confidence) ---\n")
+car::Anova(m_conf_DM, type = "III")
+
+# ------------------------------------------------------------------------------
+# Simple-effects / marginal effects on the SIU response scale
+# ------------------------------------------------------------------------------
+# We probe moderation by computing estimated marginal means (EMMs) at:
+#   -1 SD, mean, +1 SD of within-person confidence (conf_WP_z),
+# and at absA_z = 0 (average advice magnitude).
+
+# Helper function to format contrasts table
+fmt_eff <- function(x, digs = 3) {
+  x <- as.data.frame(x)
+  x %>%
+    transmute(
+      contrast,
+      Directed_Motion,
+      conf_WP_z,
+      Delta = estimate,
+      SE = SE,
+      z = z.ratio,
+      p = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value)),
+      LCL = asymp.LCL,
+      UCL = asymp.UCL,
+      ci = sprintf("[%.3f, %.3f]", LCL, UCL)
+    ) %>%
+    mutate(across(c(Delta, SE, z), round, digs))
+}
+
+# Define moderator levels: −1 SD (low), mean, +1 SD (high) confidence
+conf_levels <- c(low = -1, mean = 0, high = +1)
+
+# ------------------------------------------------------------------------------
+# Simple effects of Advice within Directed Motion, at each confidence level
+# ------------------------------------------------------------------------------
+em_advice_byDM <- emmeans(
+  m_conf_DM, ~ Advice | Directed_Motion * conf_WP_z,
+  at = list(conf_WP_z = conf_levels, absA_z = 0),
+  type = "response",
+  weights = "equal"
+)
+
+se_advice_byDM <- contrast(
+  regrid(em_advice_byDM, transform = "response"),
+  "revpairwise",
+  by = c("Directed_Motion", "conf_WP_z")
+)
+
+adv_DM_tbl <- fmt_eff(summary(se_advice_byDM, infer = TRUE))
+print(adv_DM_tbl)
+
+# ------------------------------------------------------------------------------
+# Simple effects of Directed Motion within each Advice, at each confidence level
+# ------------------------------------------------------------------------------
+dm_adv_tbl <- as.data.frame(summary(se_DM_byAdvice, infer = TRUE)) %>%
+  transmute(
+    Advice,
+    conf_WP_z,
+    contrast, Delta = estimate, SE = SE, z = z.ratio,
+    p = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value)),
+    LCL = asymp.LCL, UCL = asymp.UCL,
+    ci = sprintf("[%.3f, %.3f]", LCL, UCL)
+  ) %>%
+  mutate(across(c(Delta, SE, z), ~round(.x, 3)))
+print(dm_adv_tbl)
+
+# ------------------------------------------------------------------------------
+# Simple slopes of confidence within each Advice × Directed Motion cell
+# ------------------------------------------------------------------------------
+# This estimates the slope of conf_WP_z predicting SIU separately in each cell,
+# then tests whether slopes differ across Advice or Directed Motion.
+em_conf <- emtrends(
+  m_conf_DM, ~ Advice * Directed_Motion,
+  var = "conf_WP_z", at = list(absA_z = 0)
+)
+
+# Test Directed Motion effect on confidence slope
+pairs(em_conf, by = "Advice")
+
+# Test Advice effect on confidence slope
+pairs(em_conf, by = "Directed_Motion")
+
+# ------------------------------------------------------------------------------
+# Model reduction check: can Synchrony be dropped?
+# ------------------------------------------------------------------------------
+# Here we test whether Synchrony (and its interactions) contribute explanatory
+# power *in the presence of the confidence moderation structure*.
+
+# Treat m_conf_DM as the current reference model
+m_full <- m_conf_DM
+# Model: s_sv ~ absA_z + Advice*Directed_Motion*Synchrony + Advice*Directed_Motion*conf_WP_z + (1|participant)
+
+# Drop all Synchrony terms (main effect + interactions) 
+m_dropSyn_all <- update(
+  m_full,
+  . ~ . - Synchrony - Advice:Synchrony - Directed_Motion:Synchrony - Advice:Directed_Motion:Synchrony
+)
+
+cat("\n--- LRT: Do Synchrony terms add explanatory power? ---\n")
+anova(m_dropSyn_all, m_full)
+
+# Keep Synchrony main effect but drop its interactions (optional)
+m_dropSyn_int <- update(
+  m_full,
+  . ~ . - Advice:Synchrony - Directed_Motion:Synchrony - Advice:Directed_Motion:Synchrony
+)
+anova(m_dropSyn_int, m_full)
+
+# Also test at the no-confidence baseline (for completeness)
+m_base_noS <- update(
+  m_base,
+  . ~ . - Synchrony - Advice:Synchrony - Directed_Motion:Synchrony - Advice:Directed_Motion:Synchrony
+)
+anova(m_base_noS, m_base)
+
+# Report Type III tests on the reduced model
+car::Anova(m_dropSyn_all, type = "III")
+
+# ------------------------------------------------------------------------------
+# Final model (if Synchrony is dropped): recompute key simple effects
+# ------------------------------------------------------------------------------
+# Use reduced model as final reference
+m_final <- m_dropSyn_all
+# Equivalent to refitting: s_sv ~ absA_z + Advice * Directed_Motion * conf_WP_z + (1|participant)
+
+# Recompute all simple effects for the final model (clean confirmation)
+conf_levels <- c(low = -1, mean = 0, high = +1)
+
+# Advice simple effects within Directed Motion 
+em_advice_byDM_final <- emmeans(
+  m_final, ~ Advice | Directed_Motion * conf_WP_z,
+  at = list(conf_WP_z = conf_levels, absA_z = 0),
+  type = "response", weights = "equal"
+)
+se_advice_byDM_final <- contrast(
+  regrid(em_advice_byDM_final, transform = "response"),
+  "revpairwise", by = c("Directed_Motion", "conf_WP_z")
+)
+adv_DM_tbl_final <- fmt_eff(summary(se_advice_byDM_final, infer = TRUE))
+print(adv_DM_tbl_final)
+
+# Directed Motion simple effects within each Advice 
+em_DM_byAdvice_final <- emmeans(
+  m_final, ~ Directed_Motion | Advice * conf_WP_z,
+  at = list(conf_WP_z = conf_levels, absA_z = 0),
+  type = "response", weights = "equal"
+)
+se_DM_byAdvice_final <- contrast(
+  regrid(em_DM_byAdvice_final, transform = "response"),
+  "revpairwise", by = c("Advice", "conf_WP_z")
+)
+dm_adv_tbl_final <- as.data.frame(summary(se_DM_byAdvice_final, infer = TRUE)) %>%
+  transmute(
+    Advice, conf_WP_z, contrast,
+    Delta = estimate, SE = SE, z = z.ratio,
+    p = ifelse(p.value < .001, "< .001", sprintf("%.3f", p.value)),
+    LCL = asymp.LCL, UCL = asymp.UCL,
+    ci = sprintf("[%.3f, %.3f]", LCL, UCL)
+  ) %>%
+  mutate(across(c(Delta, SE, z), ~round(.x, 3)))
+print(dm_adv_tbl_final)
+
+# Simple slopes of confidence (from final model) 
+em_conf_final <- emtrends(
+  m_final, ~ Advice * Directed_Motion,
+  var = "conf_WP_z", at = list(absA_z = 0)
+)
+
+# Test slope differences (confidence × advice/motion)
+pairs(em_conf_final, by = "Advice")          # DM effect on slope
+pairs(em_conf_final, by = "Directed_Motion") # Advice effect on slope
+
+
+# ------------------------------------------------------------
+# Exploratory Analyses: Over vs Under & Social Information Use
+# ------------------------------------------------------------
+
+# This script examines how participants use social information (SIU)
+# depending on whether advice systematically overestimates or
+# underestimates their initial judgments.
+#
+# Exploratory aims:
+#   (1) Frequency: how often advice is ignored (SIU = 0) vs used (SIU > 0)
+#   (2) Magnitude: how strongly advice is used when it is used (s > 0)
+#   (3) Ambiguity: whether these patterns are stronger in ambiguous stimulus cells
+
+
+# ------------------------------------------------------------
+# Load cleaned SIU data and construct core variables
+# ------------------------------------------------------------
+
+infile_siu <- file.path(output_dir, "siu_trials_clean.csv")
+
+d_siu <- read_csv(infile_siu, show_col_types = FALSE) %>%
+  rename(
+    R1 = slider_response1_2.response,   # initial estimate
+    X  = agent_feedback,                # advice value
+    R2 = slider_response2_2.response,   # revised estimate
+    s  = s                              # social information use in [0,1]
+  ) %>%
+  mutate(
+    participant     = factor(participant),
+    Directed_Motion = factor(stringr::str_to_title(directed_motion),
+                             levels = c("Present", "Absent")),
+    Synchrony       = factor(stringr::str_to_title(synchrony),
+                             levels = c("High", "Medium", "Low")),
+    Advice          = factor(stringr::str_to_lower(feedback_type),
+                             levels = c("under", "over"),
+                             labels = c("Under", "Over")),
+    A    = X - R1,          # signed advice magnitude (advice − initial estimate)
+    absA = abs(A)           # absolute advice magnitude
+  ) %>%
+  filter(is.finite(R1), is.finite(R2), is.finite(s))
+
+# ------------------------------------------------------------
+# Helper: classify SIU into 3 categories for descriptive analyses
+#   SIU_0        : advice fully ignored
+#   SIU_between  : advice partially used
+#   SIU_1        : advice fully adopted
+# ------------------------------------------------------------
+
+d_siu_scat <- d_siu %>%
+  mutate(
+    SIU_cat = case_when(
+      s == 0              ~ "SIU_0",        # ignored advice
+      s > 0 & s < 1       ~ "SIU_between",  # partially used advice
+      s == 1              ~ "SIU_1",        # fully aligned with advice
+      TRUE                ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(SIU_cat))
+
+# ------------------------------------------------------------
+# ANALYSIS 1: SIU FREQUENCIES BY ADVICE DIRECTION (Over vs Under)
+# ------------------------------------------------------------
+# Goal:
+#   Before modeling SIU magnitude, we first ask a simpler question:
+#   How often do participants *ignore* the social information altogether?
+#
+# Operationalization:
+#   - SIU = 0  : advice ignored (R2 == R1; no movement toward advice)
+#   - SIU > 0  : advice used to some extent (partial or full movement toward advice)
+#
+# We proceed in three steps:
+#   1a) Within Overestimation trials: ignore vs use
+#   1b) Within Underestimation trials: ignore vs use
+#   1c) Direct comparison: is P(SIU=0) different between Over vs Under?
+#
+# Note:
+#   Binomial tests in 1a/1b use p = 0.5 as a heuristic baseline (symmetric “ignore vs use”),
+#   while the key inferential contrast is the Over vs Under comparison in 1c.
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# ANALYSIS 1a: Overestimation trials
+# ------------------------------------------------------------
+# Question:
+#   Within Over trials, are participants more likely to ignore the advice
+#   (SIU = 0) or to use it to any extent (SIU > 0)?
+#
+# Output:
+#   - Descriptive counts/proportions across SIU categories (0 / between / 1)
+#   - Collapsed comparison of SIU = 0 vs SIU > 0
+#   - Binomial test against heuristic baseline p = 0.5
+# ------------------------------------------------------------
+
+over_trials <- d_siu_scat %>%
+  filter(Advice == "Over")
+
+n_over_total <- nrow(over_trials)
+
+over_counts <- table(over_trials$SIU_cat)
+over_props  <- prop.table(over_counts)   # relative to all Over trials
+
+cat("\n[1a] Overestimation trials: counts by SIU category:\n")
+print(over_counts)
+cat("\n[1a] Overestimation trials: proportions by SIU category:\n")
+print(over_props)
+
+# Focus on SIU = 0 versus SIU > 0 (including SIU = 1)
+over_sub <- over_trials %>%
+  filter(SIU_cat %in% c("SIU_0", "SIU_between", "SIU_1"))
+
+n_over_s0      <- sum(over_sub$SIU_cat == "SIU_0")
+n_over_s_non0  <- sum(over_sub$SIU_cat != "SIU_0")  # SIU_between + SIU_1
+n_over_sub     <- n_over_s0 + n_over_s_non0
+
+cat("\n[1a] Overestimation: SIU = 0 vs SIU > 0 (within Over trials):\n")
+cat("  n(SIU = 0)      =", n_over_s0, "\n")
+cat("  n(SIU > 0)      =", n_over_s_non0, "\n")
+cat("  Prop SIU = 0    =", n_over_s0     / n_over_sub, "\n")
+cat("  Prop SIU > 0    =", n_over_s_non0 / n_over_sub, "\n")
+
+cat("\n[1a] Binomial test within Overestimation trials (SIU=0 vs SIU>0):\n")
+print(binom.test(
+  x = n_over_s0,
+  n = n_over_sub,
+  p = 0.5   # null: equally likely to ignore vs use (to any extent)
+))
+
+# ------------------------------------------------------------
+# ANALYSIS 1b: Underestimation trials
+# Same test, restricted to Under trials
+# ------------------------------------------------------------
+
+
+under_trials <- d_siu_scat %>%
+  filter(Advice == "Under")
+
+n_under_total <- nrow(under_trials)
+
+under_counts <- table(under_trials$SIU_cat)
+under_props  <- prop.table(under_counts)
+
+cat("\n[1b] Underestimation trials: counts by SIU category:\n")
+print(under_counts)
+cat("\n[1b] Underestimation trials: proportions by SIU category:\n")
+print(under_props)
+
+# Focus on SIU = 0 versus SIU > 0 (including SIU = 1)
+under_sub <- under_trials %>%
+  filter(SIU_cat %in% c("SIU_0", "SIU_between", "SIU_1"))
+
+n_under_s0      <- sum(under_sub$SIU_cat == "SIU_0")
+n_under_s_non0  <- sum(under_sub$SIU_cat != "SIU_0")  # SIU_between + SIU_1
+n_under_sub     <- n_under_s0 + n_under_s_non0
+
+cat("\n[1b] Underestimation: SIU = 0 vs SIU > 0 (within Under trials):\n")
+cat("  n(SIU = 0)      =", n_under_s0, "\n")
+cat("  n(SIU > 0)      =", n_under_s_non0, "\n")
+cat("  Prop SIU = 0    =", n_under_s0     / n_under_sub, "\n")
+cat("  Prop SIU > 0    =", n_under_s_non0 / n_under_sub, "\n")
+
+cat("\n[1b] Binomial test within Underestimation trials (SIU=0 vs SIU>0):\n")
+print(binom.test(
+  x = n_under_s0,
+  n = n_under_sub,
+  p = 0.5
+))
+
+# ------------------------------------------------------------
+# ANALYSIS 1c: Direct comparison (Over vs Under)
+# ------------------------------------------------------------
+# Question:
+#   Is advice ignored at different rates depending on advice direction?
+#   Specifically, does P(SIU = 0 | Over) differ from P(SIU = 0 | Under)?
+#
+# Approach:
+#   - Construct a binary trial-level outcome SIU_zero (1 = ignored, 0 = used)
+#   - Compare proportions using a two-proportion test / chi-square on a 2×2 table
+#   - Fit a simple logistic regression (SIU_zero ~ Advice) for an effect size
+#
+# Note:
+#   These tests treat trials as independent. As a robustness check, you could
+#   fit a mixed-effects logistic model with a random intercept for participant.
+# ------------------------------------------------------------
+
+# Create a binary variable: SIU_zero = 1 if s == 0, else 0
+d_siu_bin <- d_siu %>%
+  mutate(
+    SIU_zero = as.integer(s == 0)
+  )
+
+# 2×2 table Over/Under × SIU_zero
+
+tab_advice_siu <- table(
+  Advice = d_siu_bin$Advice,
+  SIU_zero = d_siu_bin$SIU_zero
+)
+
+cat("\n[1c] 2x2 table: Advice (Over/Under) x SIU_zero (0/1):\n")
+print(tab_advice_siu)
+
+# For clarity, extract counts:
+# rows: Advice = "Over", "Under"
+# cols: SIU_zero = 0 (used), 1 (ignored)
+n_over_s0    <- tab_advice_siu["Over",  "1"]
+n_over_s_gt0 <- tab_advice_siu["Over",  "0"]
+n_under_s0   <- tab_advice_siu["Under", "1"]
+n_under_s_gt0<- tab_advice_siu["Under", "0"]
+
+cat("\n[1c] Counts used in comparison:\n")
+cat("  Over:  SIU = 0  =", n_over_s0,    ", SIU > 0 =", n_over_s_gt0, "\n")
+cat("  Under: SIU = 0  =", n_under_s0,   ", SIU > 0 =", n_under_s_gt0, "\n")
+
+# Two-proportion / chi-square test
+
+# Compare P(SIU=0 | Over) vs P(SIU=0 | Under)
+# using the two rows of the 2×2 table
+prop_test_res <- prop.test(
+  x = c(n_over_s0,  n_under_s0),
+  n = c(n_over_s0 + n_over_s_gt0,
+        n_under_s0 + n_under_s_gt0)
+)
+
+cat("\n[1c] Two-proportion test: P(SIU=0 | Over) vs P(SIU=0 | Under):\n")
+print(prop_test_res)
+
+# Equivalent chi-square test on full 2×2 table
+chi_res <- chisq.test(tab_advice_siu)
+cat("\n[1c] Chi-square test on full 2x2 table:\n")
+print(chi_res)
+
+# Logistic regression (SIU_zero ~ Advice) 
+
+# Make sure Over is the reference level (so coefficient is Under vs Over)
+d_siu_bin$Advice <- relevel(d_siu_bin$Advice, ref = "Over")
+
+glm_siu <- glm(
+  SIU_zero ~ Advice,
+  family = binomial,
+  data   = d_siu_bin
+)
+
+cat("\n[1c] Logistic regression: SIU_zero ~ Advice (ref = Over):\n")
+summary(glm_siu)
+
+# Extract odds ratio and 95% CI for Under vs Over
+beta   <- coef(glm_siu)["AdviceUnder"]
+se     <- sqrt(vcov(glm_siu)["AdviceUnder", "AdviceUnder"])
+OR     <- exp(beta)
+CI_low <- exp(beta - 1.96 * se)
+CI_high<- exp(beta + 1.96 * se)
+
+cat("\n[1c] Odds ratio (Under vs Over) for SIU = 0:\n")
+cat("  OR =", OR, 
+    "  95% CI [", CI_low, ",", CI_high, "]\n")
+
+
+# ------------------------------------------------------------
+# PLOT: P(SIU = 0 | Advice) with participant dots + WS (C-M) 95% CI
+# ------------------------------------------------------------
+
+# Trial-level counts per Advice
+trial_summary <- d_siu %>%
+  mutate(
+    Advice = factor(Advice, levels = c("Under", "Over"))
+  ) %>%
+  group_by(Advice) %>%
+  summarise(
+    n_total  = n(),
+    n_zero   = sum(s == 0, na.rm = TRUE),
+    Mean     = n_zero / n_total,
+    .groups  = "drop"
+  )
+
+# Exact binomial 95% CI for each Advice level
+cis <- lapply(seq_len(nrow(trial_summary)), function(i) {
+  bt <- binom.test(trial_summary$n_zero[i], trial_summary$n_total[i], conf.level = 0.95)
+  c(lower = unname(bt$conf.int[1]), upper = unname(bt$conf.int[2]))
+})
+
+cis_mat <- do.call(rbind, cis)
+trial_summary$Lower <- cis_mat[, "lower"]
+trial_summary$Upper <- cis_mat[, "upper"]
+
+# Overall baseline
+p_zero_overall <- mean(d_siu$s == 0, na.rm = TRUE)
+
+p_zero_advice <- ggplot(trial_summary, aes(x = Advice, y = Mean, group = 1)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                width = 0.14, linewidth = 1.0, color = "purple") +
+  geom_line(linewidth = 1.2, color = "purple") +
+  geom_point(size = 3.2, color = "purple") +
+  # Dotted reference line at 0.50
+  geom_hline(yintercept = 0.50, linetype = 2, color = "grey60") +
+  scale_x_discrete(labels = c(
+    "Under" = "Underestimation",
+    "Over"  = "Overestimation"
+  )) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 1.00)
+  ) +
+  labs(
+    x = "Advice Direction",
+    y = "Proportion of Advice Trials\nwith Social Information Use = 0"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "none")
+
+print(p_zero_advice)
+
+# ------------------------------------------------------------
+# ANALYSIS 2: SIU MAGNITUDE WHEN ADVICE IS USED (s > 0)
+# ------------------------------------------------------------
+# Model choice:
+#   Beta regression is appropriate for continuous outcomes on (0, 1).
+#   We apply the Smithson–Verkuilen (SV) transform to avoid exact 0/1.
+#
+# Predictors:
+#   - Advice: Under vs Over
+#   - absA_z: standardized advice magnitude |X − R1|
+# Random effect:
+#   - participant intercept (trial-level data)
+# ------------------------------------------------------------
+
+siu_all <- d_siu %>%
+  filter(s > 0)   # restrict to trials with some social information use
+
+N_all <- nrow(siu_all)
+
+siu_all <- siu_all %>%
+  mutate(
+    # Smithson–Verkuilen transform to avoid exact 0/1 in beta regression
+    s_sv   = (s * (N_all - 1) + 0.5) / N_all,
+    absA_z = as.numeric(scale(absA))  # z-scored advice magnitude
+  )
+
+# Sum-to-zero contrasts for Advice (Under vs Over)
+contrasts(siu_all$Advice) <- contr.sum(2)
+
+# Beta GLMM: SIU magnitude predicted by Advice and advice magnitude |X − R1|
+m_siu_all <- glmmTMB(
+  s_sv ~ Advice + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = siu_all
+)
+
+cat("\n[3] SIU ~ Advice (all non-zero SIU trials):\n")
+summary(m_siu_all)
+
+cat("\n[3] Type III tests (all non-zero SIU):\n")
+print(car::Anova(m_siu_all, type = "III"))
+
+# Estimated marginal means of SIU (on response scale 0–1) by Advice
+emm_all <- emmeans(m_siu_all, ~ Advice, type = "response")
+cat("\n[3] Estimated mean SIU by Advice (all non-zero trials):\n")
+print(emm_all)
+
+cat("\n[3] Difference Over - Under in SIU (all non-zero trials):\n")
+print(pairs(emm_all, adjust = "none"))
+
+# Raw medians and IQRs of SIU by Advice for descriptive purposes
+siu_all %>%
+  group_by(Advice) %>%
+  summarise(
+    median_SIU = median(s),
+    IQR_low    = quantile(s, 0.25),
+    IQR_high   = quantile(s, 0.75),
+    n          = n()
+  )
+
+# ------------------------------------------------------------
+# PLOT 2: Predicted SIU magnitude (s > 0) by Advice (emmeans)
+# ------------------------------------------------------------
+
+emm_df <- as.data.frame(emm_all) %>%
+  mutate(
+    Advice = factor(Advice, levels = c("Under", "Over")),
+    Mean  = response,
+    Lower = asymp.LCL,
+    Upper = asymp.UCL
+  )
+
+p_siu_mag_advice <- ggplot(emm_df, aes(x = Advice, y = Mean, group = 1)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                width = 0.14, linewidth = 1.0, color = "purple") +
+  geom_line(linewidth = 1.2, color = "purple") +
+  geom_point(size = 3.2, color = "purple") +
+  # Dotted reference line at 0.50
+  geom_hline(yintercept = 0.50, linetype = 2, color = "grey60") +
+  scale_x_discrete(labels = c(
+    "Under" = "Underestimation",
+    "Over"  = "Overestimation"
+  )) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 1.00)
+  ) +
+  labs(
+    x = "Advice Direction",
+    y = "Social Information Use\nConditional on Advice Use (s > 0)"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "none")
+
+print(p_siu_mag_advice)
+
+ggsave(
+  file.path(output_dir, "SIU_magnitude_s_gt0_by_advice_direction_purple_emmeans.png"),
+  plot   = p_siu_mag_advice,
+  dpi    = 300, width = 7, height = 5,
+  units  = "in", bg = "white"
+)
+
+# ------------------------------------------------------------
+# ANALYSIS 3: AMBIGUOUS CONDITIONS (subset analyses)
+# ------------------------------------------------------------
+# Ambiguity definition:
+#   (Directed Motion = Present & Synchrony = Low) OR
+#   (Directed Motion = Absent  & Synchrony = High)
+#
+# We repeat:
+#   - frequency analyses (ignored vs used)
+#   - beta GLMM magnitude analyses (s > 0, and optionally including zeros via SV)
+#   - corresponding plots
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# ANALYSIS 3a: SIU magnitude in ambiguous conditions (s > 0 only)
+# ------------------------------------------------------------
+# Question:
+#   Conditional on using advice at least a little (s > 0),
+#   does SIU magnitude differ between Over vs Under advice?
+#
+# Model choice:
+#   Beta regression is used for outcomes bounded in (0, 1).
+#   We apply the Smithson–Verkuilen (SV) transform to avoid exact 0/1.
+#
+# Predictors:
+#   - Advice: Under vs Over (sum-to-zero contrast)
+#   - absA_z: standardized advice magnitude |X − R1|
+# Random effect:
+#   - participant intercept (trial-level clustering)
+# ------------------------------------------------------------
+
+
+# Build ambiguous subset (all valid s)
+siu_ambig <- d_siu %>%
+  filter(
+    (Directed_Motion == "Present" & Synchrony == "Low") |
+      (Directed_Motion == "Absent"  & Synchrony == "High")
+  ) %>%
+  filter(s > 0)   # restrict to trials with SIU > 0 in ambiguous cells
+
+N_amb <- nrow(siu_ambig)
+
+siu_ambig <- siu_ambig %>%
+  mutate(
+    s_sv   = (s * (N_amb - 1) + 0.5) / N_amb,   # SV transform
+    absA_z = as.numeric(scale(absA))
+  )
+
+
+# Sum-to-zero contrasts for Advice
+contrasts(siu_ambig$Advice) <- contr.sum(2)
+
+
+# Beta GLMM (ambiguous, s > 0)
+m_siu_ambig <- glmmTMB(
+  s_sv ~ Advice + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = siu_ambig
+)
+
+cat("\n[4] SIU ~ Advice (ambiguous conditions only; s > 0):\n")
+summary(m_siu_ambig)
+
+cat("\n[4] Type III tests (ambiguous conditions):\n")
+print(car::Anova(m_siu_ambig, type = "III"))
+
+# Estimated marginal means (response scale) by Advice
+emm_amb <- emmeans(m_siu_ambig, ~ Advice, type = "response")
+cat("\n[4] Estimated mean SIU by Advice (ambiguous conditions):\n")
+print(emm_amb)
+
+cat("\n[4] Difference Over - Under in SIU (ambiguous conditions):\n")
+print(pairs(emm_amb, adjust = "none"))
+
+# Descriptives (raw scale) for context
+siu_ambig %>%
+  group_by(Advice) %>%
+  summarise(
+    median_SIU = median(s),
+    IQR_low    = quantile(s, 0.25),
+    IQR_high   = quantile(s, 0.75),
+    n          = n()
+  )
+
+
+# ------------------------------------------------------------
+# ANALYSIS 3b: SIU magnitude in ambiguous conditions (including s = 0)
+# ------------------------------------------------------------
+# Question:
+#   When including ignored-advice trials (s = 0), does the overall
+#   distribution of SIU in ambiguous conditions differ by advice direction?
+#
+# Note:
+#   Beta regression requires (0,1), so we apply an SV transform to all s,
+#   including zeros, to allow a single beta model as a robustness variant.
+# ------------------------------------------------------------
+
+
+siu_ambig_inc0 <- d_siu %>%
+  filter(
+    (Directed_Motion == "Present" & Synchrony == "Low") |
+      (Directed_Motion == "Absent"  & Synchrony == "High")
+  ) %>%
+  filter(is.finite(s)) %>%          # keep all valid s (including zero)
+  mutate(
+    absA_z = as.numeric(scale(absA))
+  )
+
+N_amb_full <- nrow(siu_ambig_inc0)
+
+# SV transform for full [0,1] range including zeros
+siu_ambig_inc0 <- siu_ambig_inc0 %>%
+  mutate(
+    s_sv = (s * (N_amb_full - 1) + 0.5) / N_amb_full
+  )
+
+contrasts(siu_ambig_inc0$Advice) <- contr.sum(2)
+
+m_siu_ambig_inc0 <- glmmTMB(
+  s_sv ~ Advice + absA_z + (1 | participant),
+  family = beta_family(link = "logit"),
+  data   = siu_ambig_inc0
+)
+
+cat("\n[4b] SIU ~ Advice (ambiguous trials, INCLUDING s = 0) with SV squeeze:\n")
+summary(m_siu_ambig_inc0)
+
+cat("\n[4b] Type III tests (ambiguous trials, all s):\n")
+print(car::Anova(m_siu_ambig_inc0, type = "III"))
+
+emm_amb_inc0 <- emmeans(m_siu_ambig_inc0, ~ Advice, type = "response")
+cat("\n[4b] Estimated mean SIU by Advice (ambiguous, including zeros):\n")
+print(emm_amb_inc0)
+
+cat("\n[4b] Difference Under vs Over in SIU (ambiguous, including zeros):\n")
+print(pairs(emm_amb_inc0, adjust = "none"))
+
+# Descriptives including zeros (raw scale)
+siu_ambig_inc0 %>%
+  group_by(Advice) %>%
+  summarise(
+    median_SIU = median(s),
+    IQR_low    = quantile(s, 0.25),
+    IQR_high   = quantile(s, 0.75),
+    n          = n()
+  )
+
+
+# ------------------------------------------------------------
+# PLOT 3: Predicted SIU magnitude (s > 0) by Advice (ambiguous)
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Visualization of emmeans from Analysis 3a (s > 0 only).
+# ------------------------------------------------------------
+
+emm_amb_df <- as.data.frame(emm_amb) %>%
+  rename(
+    Mean  = response,   # predicted SIU on response scale
+    Lower = asymp.LCL,
+    Upper = asymp.UCL
+  )
+
+x_labels <- c("Under" = "Underestimation",
+              "Over"  = "Overestimation")
+
+p_siu_ambig <- ggplot() +
+  geom_line(
+    data = emm_amb_df,
+    aes(x = Advice, y = Mean, group = 1),
+    linewidth = 1.2, color = "purple"
+  ) +
+  geom_point(
+    data = emm_amb_df,
+    aes(x = Advice, y = Mean),
+    size = 3, color = "purple"
+  ) +
+  geom_errorbar(
+    data = emm_amb_df,
+    aes(x = Advice, ymin = Lower, ymax = Upper),
+    width = 0.10, linewidth = 0.6, color = "purple"
+  ) +
+  geom_hline(yintercept = 0.5, linetype = 2, color = "grey60") +
+  geom_hline(yintercept = 1.0, linetype = 3, color = "grey70") +
+  scale_y_continuous(breaks = y_breaks) +
+  scale_x_discrete(labels = x_labels) +
+  coord_cartesian(ylim = c(y_lo, y_hi), clip = "off") +
+  labs(
+    x = "Advice Direction",
+    y = "Social Information Use (s > 0)\nAmbiguous Conditions Only"
+  ) +
+  theme_consistent +
+  theme(
+    axis.text.x = element_text(size = 13, angle = 0, hjust = 0.5),
+    axis.text.y = element_text(size = 13)
+  )
+
+print(p_siu_ambig)
+
+ggsave(
+  file.path(output_dir, "SIU_ambiguous_by_Advice_betaMarginals_NOdots_300DPI.png"),
+  plot   = p_siu_ambig,
+  dpi    = 300, width = 7, height = 5,
+  units  = "in", bg = "white"
+)
+
+
+# ------------------------------------------------------------
+# ANALYSIS 3c: SIU frequencies in ambiguous conditions (Over vs Under)
+# ------------------------------------------------------------
+# Question:
+#   In ambiguous conditions, is advice more likely to be ignored
+#   (SIU = 0) in Over vs Under trials?
+#
+# Approach:
+#   (i) Descriptive distribution across SIU categories (0 / between / 1)
+#   (ii) Binomial tests within each advice direction (heuristic p = 0.5)
+#   (iii) Direct Over vs Under comparison using 2×2 tests and a logistic model
+#
+# Note:
+#   These frequency-based tests treat trials as independent; a mixed-effects
+#   logistic model can be added as a robustness check if desired.
+# ------------------------------------------------------------
+
+
+# Define ambiguous subset and SIU categories
+ambig <- d_siu %>%
+  filter(
+    (Directed_Motion == "Present" & Synchrony == "Low") |
+      (Directed_Motion == "Absent"  & Synchrony == "High")
+  ) %>%
+  filter(is.finite(s))
+
+# Classify SIU into 3 categories within ambiguous trials
+ambig_scat <- ambig %>%
+  mutate(
+    SIU_cat = case_when(
+      s == 0              ~ "SIU_0",        # ignored advice
+      s > 0 & s < 1       ~ "SIU_between",  # partially used advice
+      s == 1              ~ "SIU_1",        # fully aligned with advice
+      TRUE                ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(SIU_cat))
+
+
+# ------------------------------------------------------------
+# ANALYSIS 3c.i: Ambiguous OVER trials — category distribution + SIU=0 vs SIU>0
+# ------------------------------------------------------------
+
+ambig_over_trials <- ambig_scat %>%
+  filter(Advice == "Over")
+
+n_ambig_over_total <- nrow(ambig_over_trials)
+
+ambig_over_counts <- table(ambig_over_trials$SIU_cat)
+ambig_over_props  <- prop.table(ambig_over_counts)
+
+cat("\n[2.2] Ambiguous OVER trials: counts by SIU category:\n")
+print(ambig_over_counts)
+cat("\n[2.2] Ambiguous OVER trials: proportions by SIU category:\n")
+print(ambig_over_props)
+
+# Collapse to SIU = 0 vs SIU > 0 (SIU_between + SIU_1)
+ambig_over_sub <- ambig_over_trials %>%
+  filter(SIU_cat %in% c("SIU_0", "SIU_between", "SIU_1"))
+
+n_ambig_over_s0     <- sum(ambig_over_sub$SIU_cat == "SIU_0")
+n_ambig_over_s_non0 <- sum(ambig_over_sub$SIU_cat != "SIU_0")
+n_ambig_over_sub    <- n_ambig_over_s0 + n_ambig_over_s_non0
+
+cat("\n[2.2] Ambiguous OVER: SIU = 0 vs SIU > 0 (within Over trials):\n")
+cat("  n(SIU = 0)      =", n_ambig_over_s0,     "\n")
+cat("  n(SIU > 0)      =", n_ambig_over_s_non0, "\n")
+cat("  Prop SIU = 0    =", n_ambig_over_s0     / n_ambig_over_sub, "\n")
+cat("  Prop SIU > 0    =", n_ambig_over_s_non0 / n_ambig_over_sub, "\n")
+
+cat("\n[2.2] Binomial test (Ambiguous OVER; SIU=0 vs SIU>0):\n")
+print(binom.test(
+  x = n_ambig_over_s0,
+  n = n_ambig_over_sub,
+  p = 0.5  # H0: equally likely to ignore vs use in ambiguous Over trials
+))
+
+
+# ------------------------------------------------------------
+# ANALYSIS 3c.ii: Ambiguous UNDER trials — category distribution + SIU=0 vs SIU>0
+# ------------------------------------------------------------
+
+ambig_under_trials <- ambig_scat %>%
+  filter(Advice == "Under")
+
+n_ambig_under_total <- nrow(ambig_under_trials)
+
+ambig_under_counts <- table(ambig_under_trials$SIU_cat)
+ambig_under_props  <- prop.table(ambig_under_counts)
+
+cat("\n[2.3] Ambiguous UNDER trials: counts by SIU category:\n")
+print(ambig_under_counts)
+cat("\n[2.3] Ambiguous UNDER trials: proportions by SIU category:\n")
+print(ambig_under_props)
+
+# Collapse to SIU = 0 vs SIU > 0
+ambig_under_sub <- ambig_under_trials %>%
+  filter(SIU_cat %in% c("SIU_0", "SIU_between", "SIU_1"))
+
+n_ambig_under_s0     <- sum(ambig_under_sub$SIU_cat == "SIU_0")
+n_ambig_under_s_non0 <- sum(ambig_under_sub$SIU_cat != "SIU_0")
+n_ambig_under_sub    <- n_ambig_under_s0 + n_ambig_under_s_non0
+
+cat("\n[2.3] Ambiguous UNDER: SIU = 0 vs SIU > 0 (within Under trials):\n")
+cat("  n(SIU = 0)      =", n_ambig_under_s0,     "\n")
+cat("  n(SIU > 0)      =", n_ambig_under_s_non0, "\n")
+cat("  Prop SIU = 0    =", n_ambig_under_s0     / n_ambig_under_sub, "\n")
+cat("  Prop SIU > 0    =", n_ambig_under_s_non0 / n_ambig_under_sub, "\n")
+
+cat("\n[2.3] Binomial test (Ambiguous UNDER; SIU=0 vs SIU>0):\n")
+print(binom.test(
+  x = n_ambig_under_s0,
+  n = n_ambig_under_sub,
+  p = 0.5  # H0: equally likely to ignore vs use in ambiguous Under trials
+))
+
+
+# ------------------------------------------------------------
+# ANALYSIS 3c.iii: Direct comparison (ambiguous only)
+#   P(SIU = 0 | Over) vs P(SIU = 0 | Under)
+# ------------------------------------------------------------
+
+# Binary indicator within ambiguous trials:
+#   SIU_zero = 1 if s == 0 (ignored advice), 0 if s > 0 (used to any extent)
+ambig_bin <- ambig %>%
+  mutate(
+    SIU_zero = as.integer(s == 0)
+  )
+
+# 2×2 table: Advice (Over / Under) × SIU_zero (0 / 1)
+tab_ambig_advice_siu <- table(
+  Advice   = ambig_bin$Advice,
+  SIU_zero = ambig_bin$SIU_zero
+)
+
+cat("\n[2.4] Ambiguous trials: 2x2 table Advice x SIU_zero:\n")
+print(tab_ambig_advice_siu)
+
+# Extract counts (for readability)
+ambig_over_s0     <- tab_ambig_advice_siu["Over",  "1"]
+ambig_over_s_gt0  <- tab_ambig_advice_siu["Over",  "0"]
+ambig_under_s0    <- tab_ambig_advice_siu["Under", "1"]
+ambig_under_s_gt0 <- tab_ambig_advice_siu["Under", "0"]
+
+cat("\n[2.4] Counts (Ambiguous):\n")
+cat("  Over:  SIU = 0  =", ambig_over_s0,    ", SIU > 0 =", ambig_over_s_gt0,  "\n")
+cat("  Under: SIU = 0  =", ambig_under_s0,   ", SIU > 0 =", ambig_under_s_gt0, "\n")
+
+# Two-proportion test: P(SIU = 0 | Over) vs P(SIU = 0 | Under)
+ambig_prop_test <- prop.test(
+  x = c(ambig_over_s0,  ambig_under_s0),                        # SIU = 0 counts
+  n = c(ambig_over_s0 + ambig_over_s_gt0,                       # total Over (ambig)
+        ambig_under_s0 + ambig_under_s_gt0)                     # total Under (ambig)
+)
+
+cat("\n[2.4] Two-proportion test (Ambiguous): P(SIU=0 | Over) vs P(SIU=0 | Under):\n")
+print(ambig_prop_test)
+
+# Chi-square test on full 2×2 table (equivalent)
+ambig_chi <- chisq.test(tab_ambig_advice_siu)
+cat("\n[2.4] Chi-square test on 2x2 table (Ambiguous):\n")
+print(ambig_chi)
+
+# Logistic regression (Ambiguous only): SIU_zero ~ Advice
+# Over as reference level, so coefficient = Under vs Over
+ambig_bin$Advice <- relevel(ambig_bin$Advice, ref = "Over")
+
+glm_ambig_siu <- glm(
+  SIU_zero ~ Advice,
+  family = binomial,
+  data   = ambig_bin
+)
+
+cat("\n[2.4] Logistic regression (Ambiguous): SIU_zero ~ Advice (ref = Over):\n")
+summary(glm_ambig_siu)
+
+# Odds ratio and 95% CI for Under vs Over within ambiguous trials
+beta_ambig   <- coef(glm_ambig_siu)["AdviceUnder"]
+se_ambig     <- sqrt(vcov(glm_ambig_siu)["AdviceUnder", "AdviceUnder"])
+OR_ambig     <- exp(beta_ambig)
+CI_low_ambig <- exp(beta_ambig - 1.96 * se_ambig)
+CI_high_ambig<- exp(beta_ambig + 1.96 * se_ambig)
+
+cat("\n[2.4] Odds ratio (Under vs Over) for SIU = 0 (Ambiguous trials):\n")
+cat("  OR =", OR_ambig,
+    "  95% CI [", CI_low_ambig, ",", CI_high_ambig, "]\n")
+
+
+# ------------------------------------------------------------
+# PLOT 4: Participant-level P(SIU = 0 | Advice) in ambiguous trials
+# ------------------------------------------------------------
+# Same visualization logic as Plot 1, but restricted to ambiguous trials.
+# Shows per-participant proportions and group mean ± 95% CI.
+# ------------------------------------------------------------
+
+# Participant-level P(SIU = 0 | Advice) in ambiguous trials
+participant_null_ambig <- ambig %>%
+  group_by(participant, Advice) %>%
+  summarise(
+    n_trials  = n(),
+    prop_null = mean(s == 0),
+    .groups   = "drop"
+  ) %>%
+  filter(n_trials > 0, is.finite(prop_null))
+
+# Group summary across participants
+summary_null_ambig <- participant_null_ambig %>%
+  group_by(Advice) %>%
+  summarise(
+    n     = n(),
+    Mean  = mean(prop_null, na.rm = TRUE),
+    SE    = sd(prop_null, na.rm = TRUE) / sqrt(n),
+    tcrit = qt(0.975, df = n - 1),
+    Lower = Mean - tcrit * SE,
+    Upper = Mean + tcrit * SE,
+    .groups = "drop"
+  )
+
+p_null_advice_ambig <- ggplot() +
+  # group mean line
+  geom_line(
+    data = summary_null_ambig,
+    aes(x = Advice, y = Mean, group = 1),
+    linewidth = 1.2, color = "purple"
+  ) +
+  
+  # group mean points
+  geom_point(
+    data = summary_null_ambig,
+    aes(x = Advice, y = Mean),
+    size = 3, color = "purple"
+  ) +
+  
+  # 95% CI error bars
+  geom_errorbar(
+    data = summary_null_ambig,
+    aes(x = Advice, ymin = Lower, ymax = Upper),
+    width = 0.10, linewidth = 0.6, color = "purple"
+  ) +
+  
+  # baseline reference line
+  geom_hline(yintercept = p_null_overall_ambig, linetype = 2, color = "grey60") +
+  
+  scale_y_continuous(breaks = y_breaks) +
+  
+  # relabel x-axis to full words
+  scale_x_discrete(labels = c(
+    "Under" = "Underestimation",
+    "Over"  = "Overestimation"
+  )) +
+  
+  coord_cartesian(ylim = c(y_lo, y_hi), clip = "off") +
+  
+  labs(
+    x = "Advice Direction",
+    y = "Proportion of Trials with\nSocial Information Use = 0 (Ambiguous Only)"
+  ) +
+  
+  theme_consistent +
+  theme(
+    axis.text.x = element_text(size = 13, angle = 0, hjust = 0.5),
+    axis.text.y = element_text(size = 13)
+  )
+
+print(p_null_advice_ambig)
+
+ggsave(
+  file.path(output_dir, "prop_SIU0_by_advice_direction_ambiguous_faintDots_300DPI.png"),
+  plot   = p_null_advice_ambig,
+  dpi    = 300, width = 7, height = 5,
+  units  = "in", bg = "white"
+)
+
+
+---
+  
+  
+  
+  # ------------------------------------------------------------------------------
+# SIMPLIFIED FREQUENTIST FLIP MODELS (Option B)
+# Avoid separation by reducing interactions + (optional) adding covariates
+# ------------------------------------------------------------------------------
+
+# -----------------------------
+# Load & prep (thr = 0)
+# -----------------------------
+d_raw <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE)
+
+d0 <- d_raw %>%
+  transmute(
+    participant = factor(participant),
+    R1 = suppressWarnings(as.numeric(slider_response1_2.response)),
+    R2 = suppressWarnings(as.numeric(slider_response2_2.response)),
+    X  = suppressWarnings(as.numeric(agent_feedback)),
+    Directed_Motion = factor(str_to_title(directed_motion), levels = c("Present","Absent")),
+    Synchrony       = factor(str_to_title(synchrony),       levels = c("High","Medium","Low")),
+    Advice          = factor(str_to_lower(feedback_type),
+                             levels = c("under","over"),
+                             labels = c("Under","Over"))
+  ) %>%
+  mutate(
+    # categorical sign coding (thr=0)
+    cat_R1 = case_when(R1 > 0 ~ "Yes", R1 < 0 ~ "No", TRUE ~ NA_character_),
+    cat_R2 = case_when(R2 > 0 ~ "Yes", R2 < 0 ~ "No", TRUE ~ NA_character_),
+    
+    switch_any = as.integer(!is.na(cat_R1) & !is.na(cat_R2) & cat_R1 != cat_R2),
+    
+    # optional covariates (highly recommended for flips)
+    absR1 = abs(R1),          # distance to midpoint (flip propensity)
+    absA  = abs(X - R1)       # advice distance (bigger advice -> more flips)
+  ) %>%
+  filter(!is.na(cat_R1), !is.na(cat_R2)) %>%
+  droplevels()
+
+# sum-to-zero contrasts for Type III tests
+contrasts(d0$Advice)          <- contr.sum(2)
+contrasts(d0$Directed_Motion) <- contr.sum(2)
+contrasts(d0$Synchrony)       <- contr.sum(3)
+
+cat("\nN trials used =", nrow(d0), " | N participants =", n_distinct(d0$participant), "\n")
+cat("\nOverall flip rate =", mean(d0$switch_any), "\n\n")
+
+# -----------------------------
+# 1) Inspect event counts by cell
+#    (THIS tells you if a model can be estimated)
+# -----------------------------
+cell_counts <- d0 %>%
+  group_by(Advice, Directed_Motion, Synchrony) %>%
+  summarise(
+    n = n(),
+    flips = sum(switch_any),
+    flip_rate = mean(switch_any),
+    .groups = "drop"
+  )
+
+print(cell_counts)
+
+cat("\nCells with ZERO flips:\n")
+print(cell_counts %>% filter(flips == 0))
+
+# If you see many zeros, do NOT fit the full 3-way. Use the simplified set below.
+
+# -----------------------------
+# 2) Fit a hierarchy of simpler models (NO covariates first)
+# -----------------------------
+ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+
+m0_null <- glmer(
+  switch_any ~ 1 + (1 | participant),
+  data = d0, family = binomial, control = ctrl
+)
+
+m1_main <- glmer(
+  switch_any ~ Advice + Directed_Motion + Synchrony + (1 | participant),
+  data = d0, family = binomial, control = ctrl
+)
+
+m2_advDM <- glmer(
+  switch_any ~ Advice * Directed_Motion + Synchrony + (1 | participant),
+  data = d0, family = binomial, control = ctrl
+)
+
+m2_advSyn <- glmer(
+  switch_any ~ Advice * Synchrony + Directed_Motion + (1 | participant),
+  data = d0, family = binomial, control = ctrl
+)
+
+# Only try this if the above converge and cell_counts show enough flips everywhere:
+m3_both2ways <- glmer(
+  switch_any ~ Advice * Directed_Motion + Advice * Synchrony + Directed_Motion:Synchrony + (1 | participant),
+  data = d0, family = binomial, control = ctrl
+)
+
+cat("\n\n====================\nMODEL COMPARISONS (no covariates)\n====================\n")
+print(anova(m0_null, m1_main, test = "Chisq"))
+print(anova(m1_main, m2_advDM, test = "Chisq"))
+print(anova(m1_main, m2_advSyn, test = "Chisq"))
+print(anova(m1_main, m3_both2ways, test = "Chisq"))
+
+cat("\nAIC/BIC:\n")
+print(AIC(m0_null, m1_main, m2_advDM, m2_advSyn, m3_both2ways))
+print(BIC(m0_null, m1_main, m2_advDM, m2_advSyn, m3_both2ways))
+
+cat("\nType III tests for main-effects model:\n")
+print(car::Anova(m1_main, type = "III"))
+
+# -----------------------------
+# 3) RECOMMENDED: refit with covariates to stabilize flips
+#    absR1_z (distance to 0) and absA_z (advice distance)
+# -----------------------------
+d0_cov <- d0 %>%
+  mutate(
+    absR1_z = as.numeric(scale(absR1)),
+    absA_z  = as.numeric(scale(absA))
+  )
+
+# contrasts already set, but keep them safe
+contrasts(d0_cov$Advice)          <- contr.sum(2)
+contrasts(d0_cov$Directed_Motion) <- contr.sum(2)
+contrasts(d0_cov$Synchrony)       <- contr.sum(3)
+
+m1_main_cov <- glmer(
+  switch_any ~ Advice + Directed_Motion + Synchrony + absR1_z + absA_z + (1 | participant),
+  data = d0_cov, family = binomial, control = ctrl
+)
+
+m2_advDM_cov <- glmer(
+  switch_any ~ Advice * Directed_Motion + Synchrony + absR1_z + absA_z + (1 | participant),
+  data = d0_cov, family = binomial, control = ctrl
+)
+
+m2_advSyn_cov <- glmer(
+  switch_any ~ Advice * Synchrony + Directed_Motion + absR1_z + absA_z + (1 | participant),
+  data = d0_cov, family = binomial, control = ctrl
+)
+
+m3_both2ways_cov <- glmer(
+  switch_any ~ Advice * Directed_Motion + Advice * Synchrony + Directed_Motion:Synchrony +
+    absR1_z + absA_z + (1 | participant),
+  data = d0_cov, family = binomial, control = ctrl
+)
+
+cat("\n\n====================\nMODEL COMPARISONS (WITH covariates)\n====================\n")
+print(anova(m1_main_cov, m2_advDM_cov, test = "Chisq"))
+print(anova(m1_main_cov, m2_advSyn_cov, test = "Chisq"))
+print(anova(m1_main_cov, m3_both2ways_cov, test = "Chisq"))
+
+cat("\nAIC/BIC (covariates):\n")
+print(AIC(m1_main_cov, m2_advDM_cov, m2_advSyn_cov, m3_both2ways_cov))
+print(BIC(m1_main_cov, m2_advDM_cov, m2_advSyn_cov, m3_both2ways_cov))
+
+cat("\nType III tests (main + covariates):\n")
+print(car::Anova(m1_main_cov, type = "III"))
+
+# -----------------------------
+# 4) Pick the best model (you decide from LRT + AIC/BIC)
+#    and produce predicted flip rates
+# -----------------------------
+
+best_model <- m1_main_cov   # <-- CHANGE THIS to the winner (e.g., m2_advDM_cov)
+
+cat("\n\n====================\nBEST MODEL SUMMARY\n====================\n")
+print(summary(best_model))
+cat("\nType III:\n")
+print(car::Anova(best_model, type = "III"))
+
+# Predicted flip probabilities by condition (averaging over covariates at mean)
+emm_best <- emmeans(
+  best_model,
+  ~ Advice * Directed_Motion * Synchrony,
+  at = list(absR1_z = 0, absA_z = 0),
+  type = "response"
+)
+
+cat("\n\nPredicted flip probabilities (best model; covariates at mean):\n")
+print(emm_best)
+
+cat("\nAdvice simple effects within Directed_Motion × Synchrony (Holm):\n")
+print(pairs(emm_best, by = c("Directed_Motion","Synchrony"), adjust = "holm"))
+
+
+# ------------------------------------------------------------------------------
+# PREP DATA
+# ------------------------------------------------------------------------------
+
+d_raw <- read_csv(file.path(output_dir, "siu_trials_clean.csv"), show_col_types = FALSE)
+
+d_dir <- d_raw %>%
+  transmute(
+    participant = factor(participant),
+    R1 = as.numeric(slider_response1_2.response),
+    R2 = as.numeric(slider_response2_2.response),
+    X  = as.numeric(agent_feedback),
+    Advice = factor(str_to_lower(feedback_type),
+                    levels = c("under","over"),
+                    labels = c("Under","Over"))
+  ) %>%
+  mutate(
+    cat_R1 = case_when(R1 > 0 ~ "Yes",
+                       R1 < 0 ~ "No",
+                       TRUE ~ NA_character_),
+    cat_R2 = case_when(R2 > 0 ~ "Yes",
+                       R2 < 0 ~ "No",
+                       TRUE ~ NA_character_),
+    
+    absR1 = abs(R1),
+    absA  = abs(X - R1)
+  ) %>%
+  filter(!is.na(cat_R1), !is.na(cat_R2)) %>%
+  mutate(
+    absR1_z = as.numeric(scale(absR1)),
+    absA_z  = as.numeric(scale(absA))
+  )
+
+contrasts(d_dir$Advice) <- contr.sum(2)
+
+ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+
+d_to_yes <- d_dir %>%
+  filter(cat_R1 == "No") %>%
+  mutate(switch_to_yes = as.integer(cat_R2 == "Yes"))
+
+m_to_yes <- glmer(
+  switch_to_yes ~ Advice + absR1_z + absA_z + (1 | participant),
+  data = d_to_yes,
+  family = binomial,
+  control = ctrl
+)
+
+summary(m_to_yes)
+car::Anova(m_to_yes, type = "III")
+
+d_to_no <- d_dir %>%
+  filter(cat_R1 == "Yes") %>%
+  mutate(switch_to_no = as.integer(cat_R2 == "No"))
+
+m_to_no <- glmer(
+  switch_to_no ~ Advice + absR1_z + absA_z + (1 | participant),
+  data = d_to_no,
+  family = binomial,
+  control = ctrl
+)
+
+summary(m_to_no)
+car::Anova(m_to_no, type = "III")
+
+m_advice_only <- glmer(
+  switch_any ~ Advice + (1 | participant),
+  data = d0,
+  family = binomial
+)
+
+summary(m_advice_only)
+car::Anova(m_advice_only, type = "III")
+
+d0_conflict <- d0 %>%
+  mutate(
+    cat_X = case_when(
+      X > 0 ~ "Yes",
+      X < 0 ~ "No",
+      TRUE  ~ NA_character_
+    ),
+    advice_opposite = as.integer(cat_R1 != cat_X)
+  ) %>%
+  filter(!is.na(cat_X))
+
+d0_conflict %>%
+  group_by(advice_opposite) %>%
+  summarise(
+    n = n(),
+    flips = sum(switch_any),
+    flip_rate = mean(switch_any)
+  )
+
+m_conflict <- glmer(
+  switch_any ~ advice_opposite + (1 | participant),
+  data = d0_conflict,
+  family = binomial
+)
+
+summary(m_conflict)
+car::Anova(m_conflict, type = "III")
+
+# ------------------------------------------------------------------
+# DIRECTIONAL SWITCH ANALYSIS
+# Restrict to trials where advice was categorically opposite to R1
+# ------------------------------------------------------------------
+
+
+# 1) Restrict to advice-opposite trials and define switch direction
+d_conflict_dir <- d0_conflict %>%
+  filter(advice_opposite == 1) %>%
+  mutate(
+    switch_direction = case_when(
+      cat_R1 == "No"  & cat_R2 == "Yes" ~ "No_to_Yes",
+      cat_R1 == "Yes" & cat_R2 == "No"  ~ "Yes_to_No",
+      TRUE ~ "No_Switch"
+    )
+  )
+
+cat("\nTotal conflict trials:", nrow(d_conflict_dir), "\n")
+
+# ------------------------------------------------------------------
+# 2) Descriptive counts (all conflict trials)
+# ------------------------------------------------------------------
+
+cat("\nCounts (all conflict trials):\n")
+print(
+  d_conflict_dir %>%
+    count(switch_direction)
+)
+
+# ------------------------------------------------------------------
+# 3) Counts among actual switchers only
+# ------------------------------------------------------------------
+
+switchers_only <- d_conflict_dir %>%
+  filter(switch_direction != "No_Switch")
+
+cat("\nCounts (switchers only):\n")
+print(
+  switchers_only %>%
+    count(switch_direction)
+)
+
+# Extract numbers
+n_no_to_yes <- sum(switchers_only$switch_direction == "No_to_Yes")
+n_yes_to_no <- sum(switchers_only$switch_direction == "Yes_to_No")
+n_total_switches <- n_no_to_yes + n_yes_to_no
+
+cat("\nNo→Yes switches:", n_no_to_yes)
+cat("\nYes→No switches:", n_yes_to_no)
+cat("\nTotal directional switches:", n_total_switches, "\n")
+
+# ------------------------------------------------------------------
+# 4) Binomial test (are directions asymmetric?)
+# ------------------------------------------------------------------
+
+if(n_total_switches > 0){
+  
+  cat("\nBinomial test (H0: 50/50 split):\n")
+  
+  bt <- binom.test(n_no_to_yes, n_total_switches, p = 0.5)
+  print(bt)
+  
+} else {
+  
+  cat("\nNo switches observed — binomial test not possible.\n")
+}
+
+
+# ------------------------------------------------------------
+# CONDITIONAL DIRECTIONAL SWITCH ANALYSIS
+# Compare switching probabilities conditional on starting side
+# ------------------------------------------------------------
+
+library(dplyr)
+
+# Restrict to conflict trials
+d_conflict_dir <- d0_conflict %>%
+  filter(advice_opposite == 1)
+
+# Compute conditional switch probabilities
+conditional_rates <- d_conflict_dir %>%
+  group_by(cat_R1) %>%
+  summarise(
+    n_trials = n(),
+    n_switch = sum(switch_any),
+    switch_rate = mean(switch_any)
+  )
+
+cat("\nConditional switch rates (given conflict):\n")
+print(conditional_rates)
+
+# Extract numbers for test
+n_no_trials  <- conditional_rates$n_trials[conditional_rates$cat_R1 == "No"]
+n_yes_trials <- conditional_rates$n_trials[conditional_rates$cat_R1 == "Yes"]
+
+n_no_switch  <- conditional_rates$n_switch[conditional_rates$cat_R1 == "No"]
+n_yes_switch <- conditional_rates$n_switch[conditional_rates$cat_R1 == "Yes"]
+
+# 2-proportion test
+cat("\nTwo-proportion test (No→Yes vs Yes→No rates):\n")
+prop_test <- prop.test(
+  x = c(n_no_switch, n_yes_switch),
+  n = c(n_no_trials, n_yes_trials)
+)
+print(prop_test)
+
+# ------------------------------------------------------------
+# DISTANCE FROM MIDPOINT ANALYSIS (Conflict trials only)
+# ------------------------------------------------------------
+
+# Use conflict trials only
+d_dist <- d0_conflict %>%
+  filter(advice_opposite == 1) %>%
+  mutate(
+    absX = abs(X),            # distance of advice from midpoint
+    switched = factor(switch_any, levels = c(0,1),
+                      labels = c("No_Switch","Switch"))
+  )
+
+# ------------------------------------------------------------
+# 1) Descriptive table
+# ------------------------------------------------------------
+
+dist_summary <- d_dist %>%
+  group_by(cat_R1, switched) %>%
+  summarise(
+    n = n(),
+    mean_absX = mean(absX, na.rm = TRUE),
+    sd_absX = sd(absX, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nDistance from midpoint (|X|) by R1 and Switching:\n")
+print(dist_summary)
+
+# ------------------------------------------------------------
+# 2) Visual check (boxplot style summary)
+# ------------------------------------------------------------
+
+library(ggplot2)
+
+ggplot(d_dist, aes(x = switched, y = absX, fill = cat_R1)) +
+  geom_boxplot(outlier.shape = NA, alpha = .6) +
+  geom_jitter(width = .15, alpha = .3) +
+  facet_wrap(~cat_R1) +
+  theme_minimal() +
+  labs(
+    title = "Distance of Advice from Midpoint (|X|)",
+    subtitle = "Conflict trials only",
+    x = "Switch",
+    y = "|Advice from midpoint|",
+    fill = "Initial category (R1)"
+  )
+
+# ------------------------------------------------------------
+# 3) Mixed model: does |X| predict switching?
+# ------------------------------------------------------------
+
+library(lme4)
+library(car)
+
+d_dist <- d_dist %>%
+  mutate(absX_z = as.numeric(scale(absX)))
+
+m_dist <- glmer(
+  switch_any ~ absX_z * cat_R1 + (1 | participant),
+  data = d_dist,
+  family = binomial
+)
+
+cat("\n\nModel: Does advice distance predict switching?\n")
+summary(m_dist)
+
+cat("\nType III tests:\n")
+print(car::Anova(m_dist, type = "III"))
+
+
+d_check <- d0_conflict %>%
+  filter(advice_opposite == 1) %>%
+  mutate(A = X - R1, absA = abs(A), absX = abs(X), absR1 = abs(R1))
+
+summary(d_check$absA)
+summary(d_check$absX)
+
+# how many violate the ±25 rule?
+d_check %>% summarise(
+  n = n(),
+  n_absA_gt_26 = sum(absA > 26, na.rm = TRUE),
+  n_absX_gt_25 = sum(absX > 25, na.rm = TRUE)
+)
