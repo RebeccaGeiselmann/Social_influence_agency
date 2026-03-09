@@ -1,0 +1,25 @@
+# Set working directory
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper3_Social_Influence/Psychopy/resources/")
+
+# Load required libraries
+library(readxl)
+library(writexl)
+
+# Load the base Excel file (without feedback_type column)
+base_df <- read_excel("condition_list_underestimate.xlsx")
+
+# Loop to create 10 Excel condition files
+for (i in 1:10) {
+  
+  df <- base_df
+  df$feedback_type <- NA
+  
+  for (cond in unique(df$condition)) {
+    cond_rows <- which(df$condition == cond)
+    feedbacks <- sample(c(rep("under", 8), rep("random", 4)))
+    df$feedback_type[cond_rows] <- feedbacks
+  }
+  
+  file_name <- sprintf("condition_list_participant%02d.xlsx", i)
+  write_xlsx(df, file_name)
+}
