@@ -1,0 +1,171 @@
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 2:  Trial-level outlier counts per participant × condition 
+# using Tukey bounds
+# ------------------------------------------------------------------------------
+
+# Bounds are computed on participant means per condition; we apply them
+# to *trial* RT1s (after <300 ms removal) to count extreme trials
+
+# Join the Tukey thresholds onto each trial, then flag trial-level outliers
+trial_with_bounds <- no_fast %>%
+  dplyr::left_join(
+    bounds %>% dplyr::select(synchrony, directed_motion, Lower, Upper),
+    by = c("synchrony", "directed_motion")
+  ) %>%
+  dplyr::mutate(
+    rt = slider_response1_2.rt,
+    is_outlier_lower = !is.na(rt) & rt < Lower,
+    is_outlier_upper = !is.na(rt) & rt > Upper,
+    is_outlier       = is_outlier_lower | is_outlier_upper
+  )
+
+# Count outlier trials per participant × condition
+outlier_counts_by_pc <- trial_with_bounds %>%
+  dplyr::group_by(participant, synchrony, directed_motion) %>%
+  dplyr::summarise(
+    n_trials   = sum(!is.na(rt)),
+    n_below    = sum(is_outlier_lower, na.rm = TRUE),
+    n_above    = sum(is_outlier_upper, na.rm = TRUE),
+    n_outlier  = sum(is_outlier,       na.rm = TRUE),
+    prop_outlier = dplyr::if_else(n_trials > 0, n_outlier / n_trials, NA_real_),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(synchrony, directed_motion, desc(n_outlier))
+
+# Summaries: overall by condition, and totals by participant
+overall_by_condition <- outlier_counts_by_pc %>%
+  dplyr::group_by(synchrony, directed_motion) %>%
+  dplyr::summarise(
+    total_trials   = sum(n_trials),
+    total_outliers = sum(n_outlier),
+    prop_outliers  = dplyr::if_else(total_trials > 0, total_outliers / total_trials, NA_real_),
+    .groups = "drop"
+  )
+
+totals_by_participant <- outlier_counts_by_pc %>%
+  dplyr::group_by(participant) %>%
+  dplyr::summarise(
+    n_trials   = sum(n_trials),
+    n_outlier  = sum(n_outlier),
+    prop_outlier = dplyr::if_else(n_trials > 0, n_outlier / n_trials, NA_real_),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(n_outlier))
+
+# Save to CSV
+write_csv(outlier_counts_by_pc,
+          file.path(output_dir, "rt1_outlier_trial_counts_by_participant_condition.csv"))
+write_csv(overall_by_condition,
+          file.path(output_dir, "rt1_outlier_trial_counts_overall_by_condition.csv"))
+write_csv(totals_by_participant,
+          file.path(output_dir, "rt1_outlier_trial_counts_totals_by_participant.csv"))
+
+# Note: we exclude all trials that fall outside of the Tukey bounds.
+# Participants with more than 25% of trials excluded overall or more than 50% per
+# condition were excluded from analysis. 
+# These were 
+# participants 6: 83% trials excluded in one condition, 40% of trials excluded in total
+# participant 10 67% and 58% trials excluded in two conditions, 36% of trials excluded in total
+# participant 4: 26% of trials excluded 
+# Of the remaining participants 125 trials (7%) were excluded in total 
+
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 2:  Remove flagged participants
+# ------------------------------------------------------------------------------
+
+# Load
+long_table <- read.csv(file.path(output_dir, "all_participants_excluding_outliers_long.csv"))
+
+# Ensure participant is numeric
+long_table <- long_table %>% mutate(participant = as.integer(participant))
+
+# IDs to exclude
+drop_ids <- c(4L, 6L, 10L)
+
+# Sanity: which are present / missing
+present_ids <- intersect(drop_ids, unique(long_table$participant))
+missing_ids <- setdiff(drop_ids, unique(long_table$participant))
+if (length(missing_ids))
+  warning("Participant IDs not found in the file: ", paste(missing_ids, collapse = ", "))
+
+# How many rows will be removed per participant
+removed_counts <- long_table%>%
+  filter(participant %in% present_ids) %>%
+  count(participant, name = "n_rows_removed")
+
+# Filter them out
+long_filtered <- long_table %>% filter(!participant %in% drop_ids)
+
+# Save
+write_csv(long_filtered, file.path(output_dir, "all_participants_excluding_outliers_long.csv"))
+
+
+# ------------------------------------------------------------------------------
+# Trial Level Exclusion 2:  Remove trials above Tukeys bound
+# ------------------------------------------------------------------------------
+
+# Load
+long_table<- read.csv(file.path(output_dir, "all_participants_excluding_outliers_long.csv"))
+
+# Make sure keys are standardized for joining; ensure RT is numeric
+dat <- long_table %>%
+  mutate(
+    synchrony       = tolower(as.character(synchrony)),
+    directed_motion = tolower(as.character(directed_motion))
+  )
+dat$slider_response1_2.rt <- suppressWarnings(as.numeric(dat$slider_response1_2.rt))
+
+# Hard-code Upper whisker thresholds you provided 
+bounds <- tibble::tribble(
+  ~synchrony, ~directed_motion, ~Upper,
+  "high",     "absent",          4.95,
+  "high",     "present",         4.12,
+  "low",      "absent",          4.24,
+  "low",      "present",         5.25,
+  "medium",   "absent",          5.62,
+  "medium",   "present",         3.63
+)
+
+# Join thresholds and flag trials above Upper 
+dat_flag <- dat %>%
+  left_join(bounds, by = c("synchrony","directed_motion")) %>%
+  mutate(
+    rt = slider_response1_2.rt,
+    drop_upper = if_else(!is.na(rt) & !is.na(Upper) & rt > Upper, TRUE, FALSE, missing = FALSE)
+  )
+
+# Quick summaries before dropping
+overall_removed <- sum(dat_flag$drop_upper, na.rm = TRUE)
+cat("Trials above Upper whiskers to be removed:", overall_removed, "of", nrow(dat_flag), "\n")
+
+by_participant <- dat_flag %>%
+  summarise(
+    n_trials = sum(!is.na(rt)),
+    n_above  = sum(drop_upper),
+    prop_above = if_else(n_trials > 0, n_above / n_trials, NA_real_),
+    .by = participant
+  ) %>%
+  arrange(desc(n_above))
+print(by_participant)
+
+by_condition <- dat_flag %>%
+  summarise(
+    n_trials = sum(!is.na(rt)),
+    n_above  = sum(drop_upper),
+    prop_above = if_else(n_trials > 0, n_above / n_trials, NA_real_),
+    .by = c(synchrony, directed_motion)
+  ) %>%
+  arrange(synchrony, directed_motion)
+print(by_condition)
+
+# Save summaries
+write_csv(by_participant, file.path(output_dir, "rt1_aboveUpper_counts_by_participant.csv"))
+write_csv(by_condition,   file.path(output_dir, "rt1_aboveUpper_counts_by_condition.csv"))
+
+# Drop trials above Upper and save trimmed data 
+dat_trim <- dat_flag %>%
+  filter(!drop_upper) %>%
+  select(-Upper, -rt, -drop_upper)
+
+# Save as CSV
+write_csv(dat_trim, (file.path(output_dir, "all_participants_excluding_outliers_long.csv")))
