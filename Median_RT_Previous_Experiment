@@ -1,0 +1,43 @@
+library(tidyverse)
+
+# Load your data
+df <- read_csv("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2024/PhD/Paper2_Perception_Agency/Analysis_online_experiments/3rd_online_experiment/excl_outliers/all_participants_excl_outliers.csv")
+
+# Step 1: Convert RT columns to long format
+rt_long <- df %>%
+  select(starts_with("binary_question_key_resp.rt_")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "participant",
+    names_pattern = "binary_question_key_resp\\.rt_(\\d+)",
+    values_to = "RT"
+  )
+
+# Step 2: Convert condition columns to long format
+cond_long <- df %>%
+  select(starts_with("condition_")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "participant",
+    names_pattern = "condition_(\\d+)",
+    values_to = "condition"
+  )
+
+# Step 3: Combine RTs and conditions
+combined <- bind_cols(rt_long, condition = cond_long$condition)
+
+# Step 4: Drop missing values
+combined_clean <- combined %>%
+  filter(!is.na(RT), !is.na(condition))
+
+# Step 5: Calculate overall median RT
+overall_median <- median(combined_clean$RT)
+
+# Step 6: Calculate median RT per condition
+condition_medians <- combined_clean %>%
+  group_by(condition) %>%
+  summarise(median_RT = median(RT))
+
+# Print results
+print(paste("Overall median RT:", overall_median))
+print(condition_medians)
