@@ -1,0 +1,487 @@
+# ------------------------------------------------------------------------------
+# ROBUSTNESS DATASET GENERATOR FOR SIU ANALYSES
+# Creates 4 datasets:
+#   ORIGINAL: your current pipeline
+#   RC1:      remove |X-R1| < 25  (keep gap >= 25)
+#   RC2:      include opposites/overshoots (s < 0 and s > 1)
+#   RC3:      no tiny +/-2 adjustment
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Load Required Libraries
+# ------------------------------------------------------------------------------
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(car)
+# ------------------------------------------------------------------------------
+# Set Working Directory and Clear Workspace
+# ------------------------------------------------------------------------------
+rm(list = ls())
+setwd("/Users/slava/Library/Mobile Documents/com~apple~CloudDocs/Desktop/2021-2025/PhD/Paper3_Social_Influence/R_Code")
+
+input_dir  <- "DISCS_csv"
+output_dir <- "Output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+infile <- file.path(output_dir, "all_participants_excluding_outliers_long.csv")
+dat <- read_csv(infile, show_col_types = FALSE)
+
+# ------------------------------------------------------------------------------
+# Helper: Robustness SIU dataset maker (with random-trial counting)
+# ------------------------------------------------------------------------------
+
+make_siu_dataset <- function(dat,
+                             tiny = 2,
+                             eps  = 1e-8,
+                             remove_gap_lt_25 = FALSE,
+                             include_out_of_range_s = FALSE,
+                             do_tiny_adjust = TRUE) {
+  
+  # base prep
+  base <- dat %>%
+    mutate(
+      feedback_type_clean = tolower(trimws(as.character(feedback_type))),
+      R1 = suppressWarnings(as.numeric(`slider_response1_2.response`)),
+      R2 = suppressWarnings(as.numeric(`slider_response2_2.response`)),
+      X  = suppressWarnings(as.numeric(agent_feedback)),
+      
+      Directed_Motion_raw = ifelse(
+        str_detect(tolower(directed_motion), "present|\\bdp\\b"),
+        "Present",
+        ifelse(str_detect(tolower(directed_motion), "absent|\\bda\\b"),
+               "Absent", NA_character_)
+      ),
+      
+      Synchrony_raw = case_when(
+        str_detect(tolower(synchrony), "high|\\bhs\\b|^h\\b")   ~ "High",
+        str_detect(tolower(synchrony), "medium|\\bms\\b|^m\\b") ~ "Medium",
+        str_detect(tolower(synchrony), "low|\\bls\\b|^l\\b")    ~ "Low",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # keep only rows with finite numeric values ----
+  df1 <- base %>%
+    filter(is.finite(R1), is.finite(R2), is.finite(X))
+  
+  # --- COUNT random advice HERE (this is what you asked for) ---
+  is_random <- function(a) tolower(trimws(as.character(a))) %in% c("random","rnd","rand")
+  n_random_removed <- df1 %>% filter(is_random(feedback_type_clean)) %>% nrow()
+  
+  # drop random advice + map to Under/Over ----
+  df2 <- df1 %>%
+    filter(!is_random(feedback_type_clean)) %>%
+    mutate(
+      Advice_raw = case_when(
+        feedback_type_clean %in% c("over","overestimator","overestimate")    ~ "Over",
+        feedback_type_clean %in% c("under","underestimator","underestimate") ~ "Under",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(Advice_raw)) %>%
+    filter(Advice_raw %in% c("Under","Over"))
+  
+  # coerce factors + compute gap ----
+  si0 <- df2 %>%
+    mutate(
+      Advice          = factor(Advice_raw, levels = c("Under","Over")),
+      Directed_Motion = factor(Directed_Motion_raw, levels = c("Present","Absent")),
+      Synchrony       = factor(Synchrony_raw, levels = c("High","Medium","Low")),
+      participant     = factor(participant_ID),
+      gap             = abs(X - R1)
+    ) %>%
+    filter(!is.na(Directed_Motion), !is.na(Synchrony), !is.na(participant))
+  
+  # RC1: remove |X-R1| < 25 ----
+  if (remove_gap_lt_25) {
+    si0 <- si0 %>% filter(gap >= 25)
+  }
+  
+  # compute movement flags (based on ORIGINAL R2, before any tiny-adjust)
+  prep0 <- si0 %>%
+    mutate(
+      denom     = X - R1,
+      num       = R2 - R1,
+      equal_RX  = (R1 == X),
+      
+      toward    = sign(denom) * num >= 0,
+      away      = sign(denom) * num <  0,
+      overshoot = sign(denom) * (R2 - X) > 0,
+      
+      move_mag      = abs(num),
+      overshoot_mag = abs(R2 - X),
+      
+      small_overall   = move_mag <= tiny,
+      small_opposite  = away & (move_mag <= tiny),
+      small_overshoot = overshoot & (overshoot_mag <= tiny)
+    )
+  
+  # always drop X==R1 (advice impossible)
+  prep0 <- prep0 %>% filter(!equal_RX)
+  
+  # apply or skip tiny adjustment
+  prep <- prep0 %>%
+    mutate(
+      R2_adj = if (!do_tiny_adjust) {
+        R2
+      } else {
+        case_when(
+          small_overshoot ~ X,
+          small_opposite  ~ R1,
+          TRUE            ~ R2
+        )
+      },
+      
+      # SIU formula consistent with your original code
+      s = (R2_adj - R1) / pmax(abs(denom), eps) * sign(denom),
+      
+      drop_neg = s < 0,
+      drop_pos = s > 1
+    )
+  
+  # RC2: include s<0 and s>1 (otherwise, enforce 0<=s<=1)
+  if (!include_out_of_range_s) {
+    prep <- prep %>% filter(!drop_neg, !drop_pos)
+  }
+  
+  out <- prep %>%
+    filter(is.finite(s)) %>%
+    transmute(
+      participant,
+      participant_ID,
+      condition,
+      synchrony,
+      directed_motion,
+      movie_file,
+      feedback_type,
+      `slider_response1_2.response`,
+      `slider_response1_2.rt`,
+      agent_feedback,
+      `slider_response2_2.response`,
+      `slider_response2_2.rt`,
+      R2_adj,
+      s
+    )
+  
+  stopifnot(nrow(out) > 0)
+  
+  # attach the random-removed count as an attribute (handy for printing once)
+  attr(out, "n_random_removed") <- n_random_removed
+  out
+}
+
+# ------------------------------------------------------------------------------
+# Build the 4 datasets
+# ------------------------------------------------------------------------------
+
+siu_clean_original <- make_siu_dataset(dat, remove_gap_lt_25 = FALSE, include_out_of_range_s = FALSE, do_tiny_adjust = TRUE)
+siu_clean_gap25    <- make_siu_dataset(dat, remove_gap_lt_25 = TRUE,  include_out_of_range_s = FALSE, do_tiny_adjust = TRUE)
+siu_include_outofrange <- make_siu_dataset(dat, remove_gap_lt_25 = FALSE, include_out_of_range_s = TRUE, do_tiny_adjust = TRUE)
+siu_no_tiny_adjust <- make_siu_dataset(dat, remove_gap_lt_25 = FALSE, include_out_of_range_s = FALSE, do_tiny_adjust = FALSE)
+
+# ------------------------------------------------------------------------------
+# Print how many random trials were removed (once)
+# ------------------------------------------------------------------------------
+cat("\nRandom-advice trials removed (computed on finite R1/R2/X rows): ",
+    attr(siu_clean_original, "n_random_removed"), "\n")
+
+# ------------------------------------------------------------------------------
+# Save to disk
+# ------------------------------------------------------------------------------
+write_csv(siu_clean_original,       file.path(output_dir, "siu_trials_clean_original.csv"))
+write_csv(siu_clean_gap25,          file.path(output_dir, "siu_trials_clean_gap25.csv"))
+write_csv(siu_include_outofrange,   file.path(output_dir, "siu_trials_clean_include_outofrange.csv"))
+write_csv(siu_no_tiny_adjust,       file.path(output_dir, "siu_trials_clean_noTinyAdjust.csv"))
+
+cat("\nSaved robustness datasets to:", output_dir, "\n")
+
+
+# ------------------------------------------------------------------------------
+# Summaries
+# ------------------------------------------------------------------------------
+summarize_variant <- function(df, name) {
+  cat("\n---", name, "---\n")
+  cat("Trials:", nrow(df), " | Participants:", dplyr::n_distinct(df$participant), "\n")
+  cat("s summary:\n")
+  print(summary(df$s))
+  cat("Prop s==0:", mean(df$s == 0), " | Prop s==1:", mean(df$s == 1), "\n")
+  invisible(NULL)
+}
+
+summarize_variant(siu_clean_original,     "ORIGINAL (0<=s<=1, tiny adjust ON, keep gap<25)")
+summarize_variant(siu_clean_gap25,        "RC1 (0<=s<=1, tiny adjust ON, gap>=25)")
+summarize_variant(siu_include_outofrange, "RC2 (include s<0 and s>1, tiny adjust ON)")
+summarize_variant(siu_no_tiny_adjust,     "RC3 (0<=s<=1, tiny adjust OFF, keep gap<25)")
+
+# Extra diagnostic for RC2: how much is out of range?
+cat("\n--- RC2 out-of-range diagnostic ---\n")
+siu_include_outofrange %>%
+  summarise(
+    n = n(),
+    prop_s_lt_0 = mean(s < 0),
+    prop_s_gt_1 = mean(s > 1),
+    prop_s_0_1  = mean(s >= 0 & s <= 1)
+  ) %>%
+  print()
+
+
+
+# ==============================================================================
+# Robustness checks for SIU analyses (Target Model 1 + Target Model 2)
+# - Runs the SAME two target models on multiple robustness datasets
+# - Prints: omnibus Type III tests, EMMs, and simple effects
+# - Handles the "include out-of-range s" dataset by clamping into [0,1]
+#   (beta regression requires values in (0,1) after SV squeeze)
+# ==============================================================================
+
+# ==============================================================
+# PATH
+# ==============================================================
+
+output_dir <- "Output"
+
+# ==============================================================
+# HELPER FUNCTIONS
+# ==============================================================
+
+# Smithson–Verkuilen squeeze
+sv_squeeze_N <- function(x, N) {
+  (x * (N - 1) + 0.5) / N
+}
+
+# Pairwise differences on RESPONSE scale (Δ SIU)
+pairs_delta <- function(emm, by = NULL, adjust = "holm") {
+  pairs(regrid(emm, transform = "response"), by = by, adjust = adjust)
+}
+
+mean0 <- function(x) mean(x, na.rm = TRUE)
+
+# ==============================================================
+# CORE RUNNER
+# ==============================================================
+
+run_siu_targets <- function(output_dir,
+                            filename,
+                            clamp_out_of_range = FALSE,
+                            verbose = TRUE) {
+  
+  datafile <- file.path(output_dir, filename)
+  
+  if (verbose) {
+    cat("\n============================================================\n")
+    cat("ROBUSTNESS RUN ON:", filename, "\n")
+    cat("Clamp out-of-range s:", clamp_out_of_range, "\n")
+    cat("============================================================\n")
+  }
+  
+  # ------------------------------------------------------------
+  # LOAD + CLEAN
+  # ------------------------------------------------------------
+  
+  d <- read_csv(datafile, show_col_types = FALSE) %>%
+    rename(
+      R1 = slider_response1_2.response,
+      X  = agent_feedback,
+      R2 = slider_response2_2.response,
+      s  = s
+    ) %>%
+    mutate(
+      participant = factor(participant),
+      
+      # clean raw strings
+      dm_clean  = str_to_lower(str_trim(directed_motion)),
+      syn_clean = str_to_lower(str_trim(synchrony)),
+      fb_clean  = str_to_lower(str_trim(feedback_type)),
+      
+      Directed_Motion = case_when(
+        dm_clean %in% c("present","dp","directed_present") ~ "Present",
+        dm_clean %in% c("absent","da","directed_absent")   ~ "Absent",
+        TRUE ~ NA_character_
+      ),
+      
+      Synchrony = case_when(
+        syn_clean %in% c("high","hs")   ~ "High",
+        syn_clean %in% c("medium","ms") ~ "Medium",
+        syn_clean %in% c("low","ls")    ~ "Low",
+        TRUE ~ NA_character_
+      ),
+      
+      Advice = case_when(
+        fb_clean %in% c("under","underestimate","underestimator") ~ "Under",
+        fb_clean %in% c("over","overestimate","overestimator")    ~ "Over",
+        TRUE ~ NA_character_
+      ),
+      
+      Directed_Motion = factor(Directed_Motion, levels = c("Present","Absent")),
+      Synchrony       = factor(Synchrony, levels = c("High","Medium","Low")),
+      Advice          = factor(Advice, levels = c("Under","Over")),
+      
+      A    = X - R1,
+      absA = abs(A)
+    ) %>%
+    filter(
+      is.finite(s),
+      !is.na(Advice),
+      !is.na(Directed_Motion),
+      !is.na(Synchrony),
+      is.finite(absA)
+    ) %>%
+    droplevels()
+  
+  # Optional clamp for include_out_of_range dataset
+  if (clamp_out_of_range) {
+    d <- d %>% mutate(s = pmin(pmax(s, 0), 1))
+  }
+  
+  # SV squeeze using dataset N
+  N <- nrow(d)
+  d <- d %>% mutate(s_sv = sv_squeeze_N(s, N))
+  
+  # Sum coding
+  contrasts(d$Advice)          <- contr.sum(2)
+  contrasts(d$Directed_Motion) <- contr.sum(2)
+  contrasts(d$Synchrony)       <- contr.sum(3)
+  
+  # ============================================================
+  # TARGET MODEL 1
+  # ============================================================
+  
+  cat("\n--- TARGET MODEL 1 ---\n")
+  
+  m1 <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion * Synchrony + absA + (1 | participant),
+    family = beta_family(link = "logit"),
+    data = d
+  )
+  
+  cat("\nOmnibus Type III Wald χ²:\n")
+  print(car::Anova(m1, type = "III"))
+  
+  # SAFE EMM wrapper (fixes your crash)
+  emm1 <- function(specs, ...) {
+    emmeans(
+      m1, specs,
+      ...,
+      cov.reduce = list(absA = mean),
+      cov.keep = 0
+    )
+  }
+  
+  cat("\nEMMs (full 2×2×3 table):\n")
+  print(emm1(~ Advice * Directed_Motion * Synchrony, type = "response"))
+  
+  cat("\nSimple effects: Advice within DM × Sync:\n")
+  print(summary(
+    pairs_delta(
+      emm1(~ Advice | Directed_Motion * Synchrony, type = "response"),
+      by = c("Directed_Motion","Synchrony")
+    ),
+    infer = TRUE
+  ))
+  
+  # ============================================================
+  # TARGET MODEL 2 (Confidence moderation)
+  # ============================================================
+  
+  cat("\n--- TARGET MODEL 2 ---\n")
+  
+  d2 <- d %>%
+    mutate(
+      conf_strength = pmin(pmax(abs(R1)/100, 0), 1)
+    ) %>%
+    group_by(participant) %>%
+    mutate(
+      conf_mean_id = mean(conf_strength, na.rm = TRUE),
+      conf_WP      = conf_strength - conf_mean_id,
+      conf_BP      = conf_mean_id
+    ) %>%
+    ungroup() %>%
+    mutate(
+      absA_z    = as.numeric(scale(absA)),
+      conf_BP_z = as.numeric(scale(conf_BP))
+    )
+  
+  contrasts(d2$Advice)          <- contr.sum(2)
+  contrasts(d2$Directed_Motion) <- contr.sum(2)
+  contrasts(d2$Synchrony)       <- contr.sum(3)
+  
+  m2 <- glmmTMB(
+    s_sv ~ Advice * Directed_Motion * Synchrony +
+      absA_z + conf_BP_z +
+      conf_WP * Advice * Directed_Motion +
+      (1 | participant),
+    family = beta_family(link = "logit"),
+    data = d2
+  )
+  
+  cat("\nOmnibus Type III Wald χ²:\n")
+  print(car::Anova(m2, type = "III"))
+  
+  emm2 <- function(specs, ...) {
+    emmeans(
+      m2, specs,
+      ...,
+      cov.reduce = list(absA_z = mean, conf_BP_z = mean),
+      cov.keep = 0
+    )
+  }
+  
+  sd_confWP <- sd(d2$conf_WP, na.rm = TRUE)
+  conf_levels <- c(low = -sd_confWP, mean = 0, high = sd_confWP)
+  
+  cat("\nEMMs: Advice × Directed Motion at ±1 SD confidence:\n")
+  print(
+    emm2(
+      ~ Advice * Directed_Motion | conf_WP,
+      at = list(conf_WP = conf_levels, absA_z = 0, conf_BP_z = 0),
+      type = "response"
+    )
+  )
+  
+  invisible(list(m1 = m1, m2 = m2))
+}
+
+# ==============================================================
+# Data Sets
+# ==============================================================
+
+run_siu_targets(output_dir, "siu_trials_clean_original.csv")
+run_siu_targets(output_dir, "siu_trials_clean_gap25.csv")
+run_siu_targets(output_dir, "siu_trials_clean_noTinyAdjust.csv")
+run_siu_targets(output_dir, "siu_trials_clean_include_outofrange.csv",
+             clamp_out_of_range = TRUE)
+
+
+
+
+
+# Load dataset
+
+infile <- file.path(output_dir, "siu_trials_clean.csv")
+d <- read_csv(infile, show_col_types = FALSE)
+
+# Remove participants 3, 14, 15, 18
+d_filtered <- d %>%
+  filter(!participant %in% c(3, 14, 15, 18))
+
+# Check remaining participants
+d_filtered %>%
+  summarise(
+    trials = n(),
+    participants = n_distinct(participant)
+  )
+
+# Save dataset in output directory
+write_csv(
+  d_filtered,
+  file.path(output_dir, "siu_trials_clean_original_removed_3_14_15_18.csv")
+)
+
+
+
+
+
